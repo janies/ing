@@ -22,12 +22,6 @@ var (
 	gitHash   string
 )
 
-// These are Ing configuration variables.  We may want to put them in a struct or make a Config
-// type if they grow in number.
-var (
-	verbose bool
-)
-
 func main() {
 	var packetHandle *pcap.Handle
 	var err error
@@ -40,7 +34,10 @@ func main() {
 	showVersion := flag.Bool("version", false, "Show version information and exit")
 
 	// These are global configuration variables, so we need to call XxxVar().
-	flag.BoolVar(&verbose, "verbose", false, "Run Ing in verbose mode")
+	flag.BoolVar(&DebugPrintPackets, "debug-print-packets", false, "Print packets in short form")
+	flag.BoolVar(&DebugPrintFlows, "debug-print-flows", false, "Print flows in short form")
+	flag.UintVar(&ActiveTimeout, "active-timeout", 1800, "Active flow timeout in seconds")
+	flag.UintVar(&IdleTimeout, "idle-timeout", 63, "Inactive flow timout in seconds")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] INPUT\n\n", os.Args[0])
@@ -65,7 +62,7 @@ func main() {
 	}
 
 	if *isDevice {
-		packetHandle, err = pcap.OpenLive(args[0], int32(*snaplen), true, pcap.BlockForever)
+		packetHandle, err = pcap.OpenLive(args[0], int32(*snaplen), true, PcapTimeout)
 	} else {
 		packetHandle, err = pcap.OpenOffline(args[0])
 	}
