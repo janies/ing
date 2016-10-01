@@ -58,7 +58,6 @@ func main() {
 	} else {
 		packetHandle, err = pcap.OpenOffline(args[0])
 	}
-
 	defer packetHandle.Close()
 
 	if err != nil {
