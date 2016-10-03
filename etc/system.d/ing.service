@@ -1,0 +1,23 @@
+[Unit]
+Description=Threat Trace Ing
+After=network.target
+
+[Service]
+User=root
+Group=root
+EnvironmentFile=/etc/threat-trace/ing.conf
+ExecStart=/usr/local/bin/ing -banner-terms=${ING_BANNER_TERMS_FILE} \
+    -output-prefix=${ING_OUTPUT_PREFIX} -output-slug=${ING_OUTPUT_SLUG} \
+    -device ${ING_DEVICE_NAME}
+
+# Wait 5 minutes to flush before hard-killing.
+TimeoutStopSec=300
+
+# Restart if ing quits or aborts. Wait 10 seconds between each restart.
+# Never stop restarting.
+Restart=always
+RestartSec=10
+StartLimitInterval=0
+
+[Install]
+WantedBy=multi-user.target

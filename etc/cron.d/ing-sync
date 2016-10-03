@@ -1,0 +1,2 @@
+# Sync ing files every 5 minutes
+*/5 * * * * root /etc/threat-trace/ing-sync-files

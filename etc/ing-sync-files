@@ -1,0 +1,7 @@
+#!/bin/bash
+# Copyright (c) 2016, Threat Trace, LLC. All rights reserved.
+#
+# This script is a cron job for syncing files.  Since we don't have
+# a file syncing feature yet, this file does almost nothing.
+
+source /etc/threat-trace/ing.conf
