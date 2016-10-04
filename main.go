@@ -22,14 +22,25 @@ var (
 	gitHash   string
 )
 
+// These are Ing configuration variables.  We may want to put them in a struct or make a Config
+// type if they grow in number.
+var (
+	verbose bool
+)
+
 func main() {
 	var packetHandle *pcap.Handle
 	var err error
 
+	// Since these flags are local to this function, i.e. setting up a PCAP handle, we don't need
+	// them as global configuration variables.
 	bpf := flag.String("bpf", "", "Berkeley Packet Filter expression")
 	isDevice := flag.Bool("device", false, "INPUT is a live network device")
 	snaplen := flag.Int("snaplen", 65536, "Read snaplen bytes from each packet")
 	showVersion := flag.Bool("version", false, "Show version information and exit")
+
+	// These are global configuration variables, so we need to call XxxVar().
+	flag.BoolVar(&verbose, "verbose", false, "Run Ing in verbose mode")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] INPUT\n\n", os.Args[0])
