@@ -1,13 +1,11 @@
 # Ing
 
-[![GoReportCard](http://goreportcard.com/badge/elastic/beats)](http://goreportcard.com/report/elastic/beats)
-
 A packet processor and metadata collected for industrial control system (ISC) networks.
 
 ## Dependencies
 
 * [gopacket](https://github.com/google/gopacket) (`go get github.com/google/gopacket`)
-* libpcap
+* libpcap and libpcap-devel
 
 
 ## Build
