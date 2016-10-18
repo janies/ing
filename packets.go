@@ -5,9 +5,9 @@ package main
 import (
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -34,19 +34,20 @@ var (
 	payload gopacket.Payload            // layer 4
 )
 
-// MetaPacket ...
+// MetaPacket captures everything about a packet that we are about in downstream computations. It
+// is a flat data structure with minimal composition.
 type MetaPacket struct {
 	id            uint64            // Unique packet identifier
-	ts            time.Time         // Capture timestamp in Unix nanoseconds
-	sip           [16]byte          // Source IP address for IPv4 or IPv6
-	dip           [16]byte          // Dest IP address for IPv4 or IPv6
-	ipver         int               // 4 if IPv4, 6 if IPv6
+	timestamp     time.Time         // Capture timestamp in Unix nanoseconds
+	sip           IPAddress         // Source IP address for IPv4 or IPv6
+	dip           IPAddress         // Dest IP address for IPv4 or IPv6
 	sport         uint16            // Source port for TCP and UDP, typecode for ICMP
 	dport         uint16            // Dest port for TCP and UDP
 	protocol      layers.IPProtocol // TCP, UDP, ICMP, ICMPv6
 	payloadLength uint16            // Number of bytes in application payload
 	packetLength  uint16            // Number of bytes in the packet (CaptureInfo.Length)
 	tcpFlags      byte              // TCP flags if packet is TCP
+	tcpSeq        uint32            // TCP sequence number if packet is TCP
 }
 
 // Summary statistics variables
@@ -56,6 +57,7 @@ var (
 	numErrors    uint64
 	numTruncated uint64
 	totalPackets uint64
+	totalFlows   uint64
 )
 
 // TCP flags as constants
@@ -72,13 +74,13 @@ var zeroByteArray = [16]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0
 
 // PrintMetaPacket pretty-prints a MetaPacket type to standard output.
 func PrintMetaPacket(mp MetaPacket) {
-	fmt.Printf("{id: %d, ts: %d, ip: %v", mp.id, mp.ts.UnixNano(), mp.ipver)
-	if mp.ipver == 4 {
-		fmt.Printf(", sip: %s, dip: %s, proto: %s", net.IP(mp.sip[:4]).String(),
-			net.IP(mp.dip[:4]).String(), mp.protocol.String())
+	fmt.Printf("{id: %d, ts: %s", mp.id, mp.timestamp.String())
+	if mp.sip.IsIPV4() {
+		fmt.Printf(", ip: %v, sip: %s, dip: %s, proto: %s", 4, mp.sip.String(), mp.dip.String(),
+			mp.protocol.String())
 	} else {
-		fmt.Printf(", sip: %s, dip: %s, proto: %s", net.IP(mp.sip[:]).String(),
-			net.IP(mp.dip[:]).String(), mp.protocol.String())
+		fmt.Printf(", ip: %v, sip: %s, dip: %s, proto: %s", 6, mp.sip.String(), mp.dip.String(),
+			mp.protocol.String())
 	}
 	switch mp.protocol {
 	case layers.IPProtocolTCP:
@@ -102,15 +104,46 @@ func ProcessPackets(handle *pcap.Handle) {
 	// doneChan is used by the worker to indicate it has finished handling all decoded
 	// layers in layerChan.  The allows us to shut down gracefully by closing layerChan, letting the
 	// worker finish, and wrapping up any loose ends.
-	metaPacketChan := make(chan MetaPacket, 256)
-	doneChan := make(chan bool, 1) // Channel
+	printChan := make(chan MetaPacket, 256)
+	donePrintChan := make(chan bool, 1)
 	go func() {
-		for p := range metaPacketChan {
-			if verbose {
+		for p := range printChan {
+			if DebugPrintPackets {
 				PrintMetaPacket(p)
 			}
 		}
-		doneChan <- true
+		donePrintChan <- true
+	}()
+
+	// This block sets up a flow aggregator in a goroutine.
+	flowChan := make(chan MetaPacket, 100)
+	doneFlowChan := make(chan bool, 1)
+	go func() {
+		flowSet := NewFlowSet(ActiveTimeout, IdleTimeout, 10000000)
+		for p := range flowChan {
+			// First, purge idle flows every idlePacketDuration packets.
+			if totalPackets%IdlePacketDuration == 0 {
+				flowSet.Idle.Purge(p.timestamp)
+			}
+			flowSet.Add(p)
+		}
+		// Go randomizes key iteration order, so we need to grab the keys, sort them, and access
+		// the values in sorted order.  This is ok here because it's the end of the goroutine and
+		// there are presumably no more packets to process.
+		var keys Uint64Array
+		for k := range flowSet.FlowMap {
+			keys = append(keys, k)
+		}
+		sort.Sort(keys)
+		for _, k := range keys {
+			if DebugPrintFlows {
+				fmt.Println(flowSet.FlowMap[k])
+			}
+			flowSet.writer.Write(flowSet.FlowMap[k])
+		}
+		totalFlows += flowSet.NumFlows
+		flowSet.Close()
+		doneFlowChan <- true
 	}()
 
 	// Set up a goroutine to handle shutdown signals on signalChan. This lets the program gracefully
@@ -161,7 +194,7 @@ Loop:
 
 			if parser.Truncated {
 				// We have a truncated packet. Skip it for now.
-				// TODO: How are truncated packets handled?
+				// NOTE: How should we handle truncated packets?
 				numTruncated++
 				continue Loop
 			}
@@ -171,26 +204,21 @@ Loop:
 			// the channel.
 			// NOTE: This may be a profiling and optimization target.
 			mp.id = numDecoded
-			mp.ts = ci.Timestamp
+			mp.timestamp = ci.Timestamp
 			mp.packetLength = uint16(len(data))
 			for _, typ := range decoded {
 				switch typ {
 				case layers.LayerTypeIPv4:
-					mp.sip = zeroByteArray
-					mp.dip = zeroByteArray
-					copy(mp.sip[:], ip4.SrcIP)
-					copy(mp.dip[:], ip4.DstIP)
-					mp.ipver = 4
+					mp.sip.CopyFromNetIP(ip4.SrcIP, true)
+					mp.dip.CopyFromNetIP(ip4.DstIP, true)
 				case layers.LayerTypeIPv6:
-					mp.sip = zeroByteArray
-					mp.dip = zeroByteArray
-					copy(mp.sip[:], ip6.SrcIP)
-					copy(mp.dip[:], ip6.DstIP)
-					mp.ipver = 6
+					mp.sip.CopyFromNetIP(ip6.SrcIP, false)
+					mp.dip.CopyFromNetIP(ip6.DstIP, false)
 				case layers.LayerTypeTCP:
 					mp.sport = uint16(tcp.SrcPort)
 					mp.dport = uint16(tcp.DstPort)
 					mp.protocol = layers.IPProtocolTCP
+					mp.tcpSeq = tcp.Seq
 					mp.tcpFlags = 0x00
 					if tcp.FIN {
 						mp.tcpFlags |= FIN
@@ -226,13 +254,14 @@ Loop:
 					mp.payloadLength = uint16(len(payload))
 				}
 			}
-			metaPacketChan <- mp
+			printChan <- mp
+			flowChan <- mp
 		}
 	}
-	close(metaPacketChan)
-	<-doneChan
-	if verbose {
-		fmt.Printf("Processed %v packets (%v bytes) with %v decoded, %v errors, and %v truncated.\n",
-			totalPackets, numBytes, numDecoded, numErrors, numTruncated)
-	}
+	close(printChan)
+	close(flowChan)
+	<-donePrintChan
+	<-doneFlowChan
+	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, %v errors, and %v truncated.\n",
+		totalPackets, numBytes, totalFlows, numDecoded, numErrors, numTruncated)
 }
