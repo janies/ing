@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"os"
 	"testing"
 
 	"github.com/google/gopacket/pcap"
@@ -13,161 +15,237 @@ import (
 func BenchmarkFlows(b *testing.B) {
 	var handle *pcap.Handle
 	handle, _ = pcap.OpenOffline("testdata/allFileTypes.pcap")
-	DebugPrintPackets = false // Don't output packets for parsing benchmarking
+
+	// CL options
+	config.Debug.PrintPackets = false
+	config.Debug.PrintFlows = false
+	config.Debug.PrintErrors = false
+	config.ActiveTimeout = 1800
+	config.IdleTimeout = 300
+	config.OutputPrefix = "/tmp/ing/output/"
+	config.OutputRotationInterval = 5
+	config.OutputSlug = "-allFileTypes"
 	for i := 0; i < b.N; i++ {
-		ProcessPackets(handle)
+		done := make(chan struct{})
+		defer close(done)
+		wg.Add(3)
+		inPackets := GeneratePackets(done, handle)
+		inFlows := AssignFlows(done, inPackets)
+		WriteFlows(done, inFlows)
+		wg.Wait()
 	}
 	handle.Close()
+	os.RemoveAll(config.OutputPrefix)
 }
 
 // Examples
-func ExampleProcessPackets_flow_icmp() {
+func Example_flow_icmp() {
 	var handle *pcap.Handle
 	handle, _ = pcap.OpenOffline("testdata/icmp.pcap")
+	defer handle.Close()
 
 	// CL options
-	DebugPrintPackets = false
-	DebugPrintFlows = true
-	ActiveTimeout = 1800
-	IdleTimeout = 63
+	config.Debug.PrintPackets = false
+	config.Debug.PrintFlows = true
+	config.ActiveTimeout = 1800
+	config.IdleTimeout = 300
+	config.OutputPrefix = "/tmp/ing/output/"
+	config.OutputRotationInterval = 5
+	config.OutputSlug = "-icmp"
 
 	// State
-	numBytes = 0
-	numDecoded = 0
-	numErrors = 0
-	numTruncated = 0
-	totalPackets = 0
-	totalFlows = 0
-	ProcessPackets(handle)
-	handle.Close()
+	stats.NumBytes = 0
+	stats.NumDecoded = 0
+	stats.NumTruncated = 0
+	stats.TotalPackets = 0
+	stats.TotalFlows = 0
+
+	done := make(chan struct{})
+	defer close(done)
+	wg.Add(3)
+	inPackets := GeneratePackets(done, handle)
+	inFlows := AssignFlows(done, inPackets)
+	WriteFlows(done, inFlows)
+	wg.Wait()
+	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, and %v truncated.\n",
+		stats.TotalPackets, stats.NumBytes, stats.TotalFlows, stats.NumDecoded, stats.NumTruncated)
+	os.RemoveAll(config.OutputPrefix)
 	// Output:
-	// {flow_id: 5, ip4, 100.10.20.10:2048 -> 100.10.20.3:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:20.280347 -0500 CDT, end: 2006-10-01 18:14:20.281751 -0500 CDT}
-	// {flow_id: 7, ip4, 100.10.20.9:2048 -> 100.10.20.3:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:24.220302 -0500 CDT, end: 2006-10-01 18:14:24.221652 -0500 CDT}
-	// {flow_id: 4, ip4, 100.10.20.3:0 -> 100.10.20.8:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:14.398995 -0500 CDT, end: 2006-10-01 18:14:14.400434 -0500 CDT}
-	// {flow_id: 9, ip4, 100.10.20.12:2048 -> 100.10.20.3:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:58.196762 -0500 CDT, end: 2006-10-01 18:14:58.19741 -0500 CDT}
-	// {flow_id: 1, ip4, 100.10.20.7:2048 -> 100.10.20.3:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:09.038238 -0500 CDT, end: 2006-10-01 18:14:09.03964 -0500 CDT}
-	// {flow_id: 11, ip4, 100.10.20.4:771 -> 100.20.1.3:0, proto: 1, count: 3, bytes: 210, payload_bytes: 84, start: 2006-10-01 18:19:09.057429 -0500 CDT, end: 2006-10-01 18:19:09.121648 -0500 CDT}
-	// {flow_id: 2, ip4, 100.10.20.3:0 -> 100.10.20.7:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:09.038517 -0500 CDT, end: 2006-10-01 18:14:09.039729 -0500 CDT}
-	// {flow_id: 6, ip4, 100.10.20.3:0 -> 100.10.20.10:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:20.28057 -0500 CDT, end: 2006-10-01 18:14:20.282009 -0500 CDT}
-	// {flow_id: 8, ip4, 100.10.20.3:0 -> 100.10.20.9:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:24.220601 -0500 CDT, end: 2006-10-01 18:14:24.221801 -0500 CDT}
-	// {flow_id: 3, ip4, 100.10.20.8:2048 -> 100.10.20.3:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:14.398757 -0500 CDT, end: 2006-10-01 18:14:14.400133 -0500 CDT}
-	// {flow_id: 10, ip4, 100.10.20.3:0 -> 100.10.20.12:0, proto: 1, count: 2, bytes: 148, payload_bytes: 64, start: 2006-10-01 18:14:58.196922 -0500 CDT, end: 2006-10-01 18:14:58.19762 -0500 CDT}
-	// Processed 23 packets (1690 bytes) in 11 flows with 23 decoded, 0 errors, and 0 truncated.
+	// 2006-10-01 23:14:09.03823 - 23:14:09.03964 (1.402ms)  ICMPv4 8:0 100.10.20.7 -> 100.10.20.3 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:20.28034 - 23:14:20.28175 (1.404ms)  ICMPv4 8:0 100.10.20.10 -> 100.10.20.3 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:24.22030 - 23:14:24.22165 (1.35ms)  ICMPv4 8:0 100.10.20.9 -> 100.10.20.3 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:14.39899 - 23:14:14.40043 (1.439ms)  ICMPv4 0:0 100.10.20.3 -> 100.10.20.8 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:58.19676 - 23:14:58.19741 (648µs)  ICMPv4 8:0 100.10.20.12 -> 100.10.20.3 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:19:09.05742 - 23:19:09.12164 (64.219ms)  ICMPv4 3:3 100.10.20.4 -> 100.20.1.3 (count: 3, bytes: 210, payload_bytes: 84)
+	// 2006-10-01 23:14:09.03851 - 23:14:09.03972 (1.212ms)  ICMPv4 0:0 100.10.20.3 -> 100.10.20.7 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:20.28057 - 23:14:20.28200 (1.439ms)  ICMPv4 0:0 100.10.20.3 -> 100.10.20.10 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:24.22060 - 23:14:24.22180 (1.2ms)  ICMPv4 0:0 100.10.20.3 -> 100.10.20.9 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:14.39875 - 23:14:14.40013 (1.376ms)  ICMPv4 8:0 100.10.20.8 -> 100.10.20.3 (count: 2, bytes: 148, payload_bytes: 64)
+	// 2006-10-01 23:14:58.19692 - 23:14:58.19762 (698µs)  ICMPv4 0:0 100.10.20.3 -> 100.10.20.12 (count: 2, bytes: 148, payload_bytes: 64)
+	// Processed 23 packets (1690 bytes) in 11 flows with 23 decoded, and 0 truncated.
 }
 
-func ExampleProcessPackets_flow_icmp6EchoRequest() {
+func Example_flow_icmp6EchoRequest() {
 	var handle *pcap.Handle
 	handle, _ = pcap.OpenOffline("testdata/icmp6-echo-request.pcap")
+	defer handle.Close()
 
 	// CL options
-	DebugPrintPackets = false
-	DebugPrintFlows = true
-	ActiveTimeout = 1800
-	IdleTimeout = 63
+	config.Debug.PrintPackets = false
+	config.Debug.PrintFlows = true
+	config.ActiveTimeout = 1800
+	config.IdleTimeout = 300
+	config.OutputPrefix = "/tmp/ing/output/"
+	config.OutputRotationInterval = 5
+	config.OutputSlug = "-icmp6-echo-request"
 
 	// State
-	numBytes = 0
-	numDecoded = 0
-	numErrors = 0
-	numTruncated = 0
-	totalPackets = 0
-	totalFlows = 0
-	ProcessPackets(handle)
-	handle.Close()
+	stats.NumBytes = 0
+	stats.NumDecoded = 0
+	stats.NumTruncated = 0
+	stats.TotalPackets = 0
+	stats.TotalFlows = 0
+
+	done := make(chan struct{})
+	defer close(done)
+	wg.Add(3)
+	inPackets := GeneratePackets(done, handle)
+	inFlows := AssignFlows(done, inPackets)
+	WriteFlows(done, inFlows)
+	wg.Wait()
+	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, and %v truncated.\n",
+		stats.TotalPackets, stats.NumBytes, stats.TotalFlows, stats.NumDecoded, stats.NumTruncated)
+	os.RemoveAll(config.OutputPrefix)
 	// Output:
-	// {flow_id: 1, ip6, :::32768 -> ff02::1:0, proto: 58, count: 1, bytes: 62, payload_bytes: 0, start: 2008-11-26 14:06:11.994161 -0600 CST, end: 2008-11-26 14:06:11.994161 -0600 CST}
-	// {flow_id: 2, ip6, ff02::1:33024 -> :::0, proto: 58, count: 1, bytes: 62, payload_bytes: 0, start: 2008-11-26 14:06:11.994421 -0600 CST, end: 2008-11-26 14:06:11.994421 -0600 CST}
-	// Processed 2 packets (124 bytes) in 2 flows with 2 decoded, 0 errors, and 0 truncated.
+	// 2008-11-26 20:06:11.99416 - 20:06:11.99416 (0s)  ICMPv6 128:0 :: -> ff02::1 (count: 1, bytes: 62, payload_bytes: 0)
+	// 2008-11-26 20:06:11.99442 - 20:06:11.99442 (0s)  ICMPv6 129:0 ff02::1 -> :: (count: 1, bytes: 62, payload_bytes: 0)
+	// Processed 2 packets (124 bytes) in 2 flows with 2 decoded, and 0 truncated.
 }
 
-func ExampleProcessPackets_flow_tcpCompleteV4() {
+func Example_flow_tcpCompleteV4() {
 	var handle *pcap.Handle
 	handle, _ = pcap.OpenOffline("testdata/tcp-complete-v4.pcap")
+	defer handle.Close()
 
 	// CL options
-	DebugPrintPackets = false
-	DebugPrintFlows = true
-	ActiveTimeout = 1800
-	IdleTimeout = 63
+	config.Debug.PrintPackets = false
+	config.Debug.PrintFlows = true
+	config.ActiveTimeout = 1800
+	config.IdleTimeout = 300
+	config.OutputPrefix = "/tmp/ing/output/"
+	config.OutputRotationInterval = 5
+	config.OutputSlug = "-tcp-complete-v4"
 
 	// State
-	numBytes = 0
-	numDecoded = 0
-	numErrors = 0
-	numTruncated = 0
-	totalPackets = 0
-	totalFlows = 0
-	ProcessPackets(handle)
-	handle.Close()
+	stats.NumBytes = 0
+	stats.NumDecoded = 0
+	stats.NumTruncated = 0
+	stats.TotalPackets = 0
+	stats.TotalFlows = 0
+
+	done := make(chan struct{})
+	defer close(done)
+	wg.Add(3)
+	inPackets := GeneratePackets(done, handle)
+	inFlows := AssignFlows(done, inPackets)
+	WriteFlows(done, inFlows)
+	wg.Wait()
+	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, and %v truncated.\n",
+		stats.TotalPackets, stats.NumBytes, stats.TotalFlows, stats.NumDecoded, stats.NumTruncated)
+	os.RemoveAll(config.OutputPrefix)
 	// Output:
-	// {flow_id: 2, ip4, 192.168.0.7:2111 -> 192.168.0.5:1449, proto: 6, count: 2, bytes: 122, payload_bytes: 0, start: 2009-04-27 16:00:04.084535 -0500 CDT, end: 2009-04-27 16:00:07.173944 -0500 CDT}
-	// {flow_id: 1, ip4, 192.168.0.5:1449 -> 192.168.0.7:2111, proto: 6, count: 3, bytes: 170, payload_bytes: 0, start: 2009-04-27 16:00:04.066108 -0500 CDT, end: 2009-04-27 16:00:07.173911 -0500 CDT}
-	// Processed 5 packets (292 bytes) in 2 flows with 5 decoded, 0 errors, and 0 truncated.
+	// 2009-04-27 21:00:04.06610 - 21:00:07.17391 (3.107803s) TCP 192.168.0.5:1449 -> 192.168.0.7:2111 (count: 3, bytes: 170, payload_bytes: 0)
+	// 2009-04-27 21:00:04.08453 - 21:00:07.17394 (3.089409s) TCP 192.168.0.7:2111 -> 192.168.0.5:1449 (count: 2, bytes: 122, payload_bytes: 0)
+	// Processed 5 packets (292 bytes) in 2 flows with 5 decoded, and 0 truncated.
 }
 
-func ExampleProcessPackets_flow_tcpCompleteV6() {
+func Example_flow_tcpCompleteV6() {
 	var handle *pcap.Handle
 	handle, _ = pcap.OpenOffline("testdata/tcp-complete-v6.pcap")
+	defer handle.Close()
 
 	// CL options
-	DebugPrintPackets = false
-	DebugPrintFlows = true
-	ActiveTimeout = 1800
-	IdleTimeout = 63
+	config.Debug.PrintPackets = false
+	config.Debug.PrintFlows = true
+	config.ActiveTimeout = 1800
+	config.IdleTimeout = 300
+	config.OutputPrefix = "/tmp/ing/output/"
+	config.OutputRotationInterval = 5
+	config.OutputSlug = "-tcp-complete-v6"
 
 	// State
-	numBytes = 0
-	numDecoded = 0
-	numErrors = 0
-	numTruncated = 0
-	totalPackets = 0
-	totalFlows = 0
-	ProcessPackets(handle)
-	handle.Close()
+	stats.NumBytes = 0
+	stats.NumDecoded = 0
+	stats.NumTruncated = 0
+	stats.TotalPackets = 0
+	stats.TotalFlows = 0
+
+	done := make(chan struct{})
+	defer close(done)
+	wg.Add(3)
+	inPackets := GeneratePackets(done, handle)
+	inFlows := AssignFlows(done, inPackets)
+	WriteFlows(done, inFlows)
+	wg.Wait()
+	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, and %v truncated.\n",
+		stats.TotalPackets, stats.NumBytes, stats.TotalFlows, stats.NumDecoded, stats.NumTruncated)
+	os.RemoveAll(config.OutputPrefix)
 	// Output:
-	// {flow_id: 2, ip6, fe80::7:2111 -> fe80::5:1449, proto: 6, count: 2, bytes: 162, payload_bytes: 0, start: 2009-04-27 21:57:03.693061 -0500 CDT, end: 2009-04-27 21:57:03.6977 -0500 CDT}
-	// {flow_id: 1, ip6, fe80::5:1449 -> fe80::7:2111, proto: 6, count: 3, bytes: 230, payload_bytes: 0, start: 2009-04-27 21:57:03.6915 -0500 CDT, end: 2009-04-27 21:57:03.696151 -0500 CDT}
-	// Processed 5 packets (392 bytes) in 2 flows with 5 decoded, 0 errors, and 0 truncated.
+	// 2009-04-28 02:57:03.69150 - 02:57:03.69615 (4.651ms) TCP fe80::5.1449 -> fe80::7.2111 (count: 3, bytes: 230, payload_bytes: 0)
+	// 2009-04-28 02:57:03.69306 - 02:57:03.69770 (4.639ms) TCP fe80::7.2111 -> fe80::5.1449 (count: 2, bytes: 162, payload_bytes: 0)
+	// Processed 5 packets (392 bytes) in 2 flows with 5 decoded, and 0 truncated.
 }
 
-func ExampleProcessPackets_flow_vlan() {
+func Example_flow_vlan() {
 	var handle *pcap.Handle
 	handle, _ = pcap.OpenOffline("testdata/vlan.pcap")
+	defer handle.Close()
 
 	// CL options
-	DebugPrintPackets = false
-	DebugPrintFlows = true
-	ActiveTimeout = 1800
-	IdleTimeout = 63
+	config.Debug.PrintPackets = false
+	config.Debug.PrintFlows = true
+	config.ActiveTimeout = 1800
+	config.IdleTimeout = 300
+	config.OutputPrefix = "/tmp/ing/output/"
+	config.OutputRotationInterval = 5
+	config.OutputSlug = "-vlan"
 
 	// State
-	numBytes = 0
-	numDecoded = 0
-	numErrors = 0
-	numTruncated = 0
-	totalPackets = 0
-	totalFlows = 0
-	ProcessPackets(handle)
-	handle.Close()
+	stats.NumBytes = 0
+	stats.NumDecoded = 0
+	stats.NumTruncated = 0
+	stats.TotalPackets = 0
+	stats.TotalFlows = 0
+
+	done := make(chan struct{})
+	defer close(done)
+	wg.Add(3)
+	inPackets := GeneratePackets(done, handle)
+	inFlows := AssignFlows(done, inPackets)
+	WriteFlows(done, inFlows)
+	wg.Wait()
+	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, and %v truncated.\n",
+		stats.TotalPackets, stats.NumBytes, stats.TotalFlows, stats.NumDecoded, stats.NumTruncated)
+	os.RemoveAll(config.OutputPrefix)
 	// Output:
-	// {flow_id: 8, ip4, 131.151.104.96:137 -> 131.151.107.255:137, proto: 17, count: 3, bytes: 288, payload_bytes: 150, start: 1999-11-05 12:20:41.521798 -0600 CST, end: 1999-11-05 12:20:43.02384 -0600 CST}
-	// {flow_id: 19, ip4, 131.151.115.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.375145 -0600 CST, end: 1999-11-05 12:20:43.375145 -0600 CST}
-	// {flow_id: 16, ip4, 131.151.32.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.25041 -0600 CST, end: 1999-11-05 12:20:43.25041 -0600 CST}
-	// {flow_id: 3, ip4, 131.151.5.55:138 -> 131.151.5.255:138, proto: 17, count: 1, bytes: 247, payload_bytes: 201, start: 1999-11-05 12:20:40.112031 -0600 CST, end: 1999-11-05 12:20:40.112031 -0600 CST}
-	// {flow_id: 11, ip4, 131.151.6.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.08701 -0600 CST, end: 1999-11-05 12:20:43.08701 -0600 CST}
-	// {flow_id: 6, ip4, 131.151.6.171:2048 -> 131.151.32.129:0, proto: 1, count: 5, bytes: 7575, payload_bytes: 7345, start: 1999-11-05 12:20:40.258261 -0600 CST, end: 1999-11-05 12:20:44.257898 -0600 CST}
-	// {flow_id: 5, ip4, 131.151.32.129:1173 -> 131.151.32.21:6000, proto: 6, count: 27, bytes: 12918, payload_bytes: 11188, start: 1999-11-05 12:20:40.178702 -0600 CST, end: 1999-11-05 12:20:44.502622 -0600 CST}
-	// {flow_id: 10, ip4, 131.151.5.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.079765 -0600 CST, end: 1999-11-05 12:20:43.079765 -0600 CST}
-	// {flow_id: 4, ip4, 131.151.32.21:6000 -> 131.151.32.129:1173, proto: 6, count: 19, bytes: 2066, payload_bytes: 3584, start: 1999-11-05 12:20:40.16235 -0600 CST, end: 1999-11-05 12:20:44.501093 -0600 CST}
-	// {flow_id: 2, ip4, 131.151.32.21:6000 -> 131.151.32.129:1162, proto: 6, count: 42, bytes: 9756, payload_bytes: 12312, start: 1999-11-05 12:20:40.064555 -0600 CST, end: 1999-11-05 12:20:44.130376 -0600 CST}
-	// {flow_id: 13, ip4, 131.151.10.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.11533 -0600 CST, end: 1999-11-05 12:20:43.11533 -0600 CST}
-	// {flow_id: 7, ip4, 131.151.32.129:0 -> 131.151.6.171:0, proto: 1, count: 5, bytes: 7575, payload_bytes: 7345, start: 1999-11-05 12:20:40.258417 -0600 CST, end: 1999-11-05 12:20:44.258042 -0600 CST}
-	// {flow_id: 17, ip4, 131.151.107.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.363348 -0600 CST, end: 1999-11-05 12:20:43.363348 -0600 CST}
-	// {flow_id: 14, ip4, 131.151.20.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.1705 -0600 CST, end: 1999-11-05 12:20:43.1705 -0600 CST}
-	// {flow_id: 1, ip4, 131.151.32.129:1162 -> 131.151.32.21:6000, proto: 6, count: 96, bytes: 59948, payload_bytes: 55790, start: 1999-11-05 12:20:40.056226 -0600 CST, end: 1999-11-05 12:20:44.114318 -0600 CST}
-	// {flow_id: 15, ip4, 131.151.32.79:138 -> 131.151.32.255:138, proto: 17, count: 1, bytes: 247, payload_bytes: 201, start: 1999-11-05 12:20:43.183825 -0600 CST, end: 1999-11-05 12:20:43.183825 -0600 CST}
-	// {flow_id: 9, ip4, 131.151.32.71:138 -> 131.151.32.255:138, proto: 17, count: 1, bytes: 247, payload_bytes: 201, start: 1999-11-05 12:20:42.063074 -0600 CST, end: 1999-11-05 12:20:42.063074 -0600 CST}
-	// {flow_id: 18, ip4, 131.151.111.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.36821 -0600 CST, end: 1999-11-05 12:20:43.36821 -0600 CST}
-	// {flow_id: 12, ip4, 131.151.1.254:520 -> 255.255.255.255:520, proto: 17, count: 1, bytes: 70, payload_bytes: 24, start: 1999-11-05 12:20:43.09654 -0600 CST, end: 1999-11-05 12:20:43.09654 -0600 CST}
-	// Processed 395 packets (101663 bytes) in 19 flows with 210 decoded, 185 errors, and 0 truncated.
+	// 1999-11-05 18:20:41.52179 - 18:20:43.02384 (1.502042s) UDP 131.151.104.96:137 -> 131.151.107.255:137 (count: 3, bytes: 288, payload_bytes: 150)
+	// 1999-11-05 18:20:43.37514 - 18:20:43.37514 (0s) UDP 131.151.115.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:43.25041 - 18:20:43.25041 (0s) UDP 131.151.32.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:40.11203 - 18:20:40.11203 (0s) UDP 131.151.5.55:138 -> 131.151.5.255:138 (count: 1, bytes: 247, payload_bytes: 201)
+	// 1999-11-05 18:20:43.08701 - 18:20:43.08701 (0s) UDP 131.151.6.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:40.25826 - 18:20:44.25789 (3.999637s)  ICMPv4 8:0 131.151.6.171 -> 131.151.32.129 (count: 5, bytes: 7575, payload_bytes: 7345)
+	// 1999-11-05 18:20:40.17870 - 18:20:44.50262 (4.32392s) TCP 131.151.32.129:1173 -> 131.151.32.21:6000 (count: 27, bytes: 12918, payload_bytes: 11028)
+	// 1999-11-05 18:20:43.07976 - 18:20:43.07976 (0s) UDP 131.151.5.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:40.16235 - 18:20:44.50109 (4.338743s) TCP 131.151.32.21:6000 -> 131.151.32.129:1173 (count: 19, bytes: 2066, payload_bytes: 736)
+	// 1999-11-05 18:20:40.06455 - 18:20:44.13037 (4.065821s) TCP 131.151.32.21:6000 -> 131.151.32.129:1162 (count: 42, bytes: 9756, payload_bytes: 6816)
+	// 1999-11-05 18:20:43.11533 - 18:20:43.11533 (0s) UDP 131.151.10.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:40.25841 - 18:20:44.25804 (3.999625s)  ICMPv4 0:0 131.151.32.129 -> 131.151.6.171 (count: 5, bytes: 7575, payload_bytes: 7345)
+	// 1999-11-05 18:20:43.36334 - 18:20:43.36334 (0s) UDP 131.151.107.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:43.17050 - 18:20:43.17050 (0s) UDP 131.151.20.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:40.05622 - 18:20:44.11431 (4.058092s) TCP 131.151.32.129:1162 -> 131.151.32.21:6000 (count: 96, bytes: 59948, payload_bytes: 53228)
+	// 1999-11-05 18:20:43.18382 - 18:20:43.18382 (0s) UDP 131.151.32.79:138 -> 131.151.32.255:138 (count: 1, bytes: 247, payload_bytes: 201)
+	// 1999-11-05 18:20:42.06307 - 18:20:42.06307 (0s) UDP 131.151.32.71:138 -> 131.151.32.255:138 (count: 1, bytes: 247, payload_bytes: 201)
+	// 1999-11-05 18:20:43.36821 - 18:20:43.36821 (0s) UDP 131.151.111.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// 1999-11-05 18:20:43.09654 - 18:20:43.09654 (0s) UDP 131.151.1.254:520 -> 255.255.255.255:520 (count: 1, bytes: 70, payload_bytes: 24)
+	// Processed 395 packets (101663 bytes) in 19 flows with 210 decoded, and 0 truncated.
 }

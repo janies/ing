@@ -4,17 +4,12 @@ package main
 
 import (
 	"fmt"
+	"log"
+	"sort"
 	"time"
-)
 
-// FlowTuple is a standard 5-tuple for IP flows
-type FlowTuple struct {
-	Sip   IPAddress
-	Dip   IPAddress
-	Sport uint16
-	Dport uint16
-	Proto uint8
-}
+	"github.com/google/gopacket/layers"
+)
 
 const (
 	fnvBasis = 14695981039346656037
@@ -30,6 +25,15 @@ func fnvHashSlice(b []byte) (h uint64) {
 		h *= fnvPrime
 	}
 	return
+}
+
+// FlowTuple is a standard 5-tuple for IP flows
+type FlowTuple struct {
+	Sip   IPAddress
+	Dip   IPAddress
+	Sport uint16
+	Dport uint16
+	Proto layers.IPProtocol
 }
 
 // Hash provides a quick non-cryptographic hash value of a FlowTuple.
@@ -56,8 +60,27 @@ func (ft *FlowTuple) Copy(dst *FlowTuple) {
 }
 
 func (ft FlowTuple) String() string {
-	return fmt.Sprintf("%s:%d -> %s:%d, proto: %d", ft.Sip.String(), ft.Sport, ft.Dip.String(),
-		ft.Dport, ft.Proto)
+	switch ft.Proto {
+	case layers.IPProtocolTCP:
+		fallthrough
+	case layers.IPProtocolUDP:
+		if ft.Sip.Version == 4 {
+			return fmt.Sprintf("%s %s:%d -> %s:%d", ft.Proto.String(), ft.Sip.String(), ft.Sport,
+				ft.Dip.String(), ft.Dport)
+		}
+		return fmt.Sprintf("%s %s.%d -> %s.%d", ft.Proto.String(), ft.Sip.String(), ft.Sport,
+			ft.Dip.String(), ft.Dport)
+	case layers.IPProtocolICMPv4:
+		return fmt.Sprintf(" %s %d:%d %s -> %s", ft.Proto.String(),
+			layers.ICMPv4TypeCode(ft.Sport).Type(), layers.ICMPv4TypeCode(ft.Sport).Code(),
+			ft.Sip.String(), ft.Dip.String())
+	case layers.IPProtocolICMPv6:
+		return fmt.Sprintf(" %s %d:%d %s -> %s", ft.Proto.String(),
+			layers.ICMPv6TypeCode(ft.Sport).Type(), layers.ICMPv6TypeCode(ft.Sport).Code(),
+			ft.Sip.String(), ft.Dip.String())
+	default:
+		return fmt.Sprintf("* Unknown flow *")
+	}
 }
 
 // Flow is a complete description of a netflow session.
@@ -74,14 +97,16 @@ type Flow struct {
 	RestTCPFlags     uint8
 	FirstTCPSequence uint32
 	LastTCPSequence  uint32
-	ClosureCause     int
+	ClosureReason    int
 }
 
 // Reasons for flow closure
 const (
 	ClosureNormal = iota
 	ClosureActiveTimeout
-	ClosureUnknown
+	ClosureIdleTimeout
+	ClosurePcapEOF
+	ClosureResourceExhaustion
 )
 
 // HasFINFlag ...
@@ -104,7 +129,197 @@ func (f Flow) Equal(x Equaler) bool {
 }
 
 func (f Flow) String() string {
-	return fmt.Sprintf("{flow_id: %v, ip%v, %s, count: %v, bytes: %v, payload_bytes: %v, start: %s, end: %s}",
-		f.ID, f.Tuple.Sip.Version, f.Tuple.String(), f.NumPackets, f.NumBytes, f.NumPayloadBytes,
-		f.StartTime.String(), f.EndTime.String())
+	return fmt.Sprintf("%s - %s (%s) %s (count: %v, bytes: %v, payload_bytes: %v)",
+		f.StartTime.UTC().Format("2006-01-02 15:04:05.00000"), f.EndTime.UTC().Format("15:04:05.00000"),
+		time.Duration(f.EndTime.Sub(f.StartTime)),
+		f.Tuple.String(), f.NumPackets, f.NumBytes, f.NumPayloadBytes)
+}
+
+// AssignFlows ...
+func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
+	out := make(chan Flow, 256)
+	go func() {
+		defer close(out)
+		const (
+			capacity               = 10000000
+			oooBound time.Duration = 5 * time.Microsecond
+		)
+		var (
+			flowMap          = make(map[uint64]Flow, capacity)
+			idleCache        = NewIdleCache(capacity)
+			currentTimestamp time.Time
+			numFlows         uint64
+			tuple            FlowTuple
+			flow             Flow
+			idle             IdleElem
+			hash             uint64
+			oooPacket        bool
+			ok               bool
+			terminateFlow    bool
+			deltaTimestamp   time.Duration
+			activeTimeout    = time.Duration(config.ActiveTimeout) * time.Second
+			idleTimeout      = time.Duration(config.IdleTimeout) * time.Second
+		)
+
+	Loop:
+		for mp := range in {
+			select {
+			case <-done:
+				break Loop
+			default:
+				// Reasons for terminating a flow:
+				// 1. A TCP session ends normally (see a [FIN,ACK] or a [RST] flag).
+				// 2. The map is full (terminate the oldest flows).
+				// 3. See a packet after ActiveTimeout seconds.
+				// 4. Don't see a packet after IdleTimeout seconds (PurgeIdleFlows() receiver method).
+				//
+				// TODO: Implement flow termination logic for reasons 2.
+
+				// Purge inactive flows from the map and idle cache.  We make things easy and use a
+				// closure for the callback to IdleCache.Purge().
+				idleCache.Purge(mp.timestamp, func(hash uint64) {
+					if flow, ok = flowMap[hash]; ok {
+						if config.Debug.PrintFlows {
+							fmt.Println(flow.String())
+						}
+						flow.ClosureReason = ClosureIdleTimeout
+						delete(flowMap, hash)
+						if config.FilterSmallFlows && (flow.Tuple.Proto == layers.IPProtocolTCP) &&
+							(flow.NumPackets < 4) {
+							return
+						}
+						out <- flow
+					}
+				})
+
+				// Update the current timestamp
+				deltaTimestamp = mp.timestamp.Sub(currentTimestamp)
+				oooPacket = false
+				if deltaTimestamp < -oooBound {
+					continue Loop // Drop packet because it's too old.
+				} else if (deltaTimestamp < 0) && (deltaTimestamp >= -oooBound) {
+					oooPacket = true // Out of order but keep it
+					log.Println("Out of order packet at ", mp.timestamp.String())
+				} else {
+					currentTimestamp = mp.timestamp
+				}
+
+				// Construct a flow tuple and its hash.
+				// REVIEW: This might be inefficient. Take a look at the sync/atomic Value type.
+				tuple.Sip = mp.sip
+				tuple.Dip = mp.dip
+				tuple.Sport = mp.sport
+				tuple.Dport = mp.dport
+				tuple.Proto = mp.protocol
+				hash = tuple.Hash()
+				if flow, ok = flowMap[hash]; ok {
+					// Flow exists in the set. Update and terminate, if necessary.
+					// First, check for an active timeout for the flow.
+					if flow.ActiveTimeout.Before(mp.timestamp) {
+						// Termination reason 3
+						flow.ClosureReason = ClosureActiveTimeout
+						if config.Debug.PrintFlows {
+							fmt.Println(flow.String())
+						}
+						delete(flowMap, hash)
+						idleCache.Remove(hash)
+						if config.FilterSmallFlows && (flow.Tuple.Proto == layers.IPProtocolTCP) &&
+							(flow.NumPackets < 4) {
+							continue Loop
+						}
+						out <- flow
+						// NOTE: Since this is a continuation of a flow, we create a new flow by
+						// dropping out of this branch. DO NOT RETURN.
+					} else {
+						// This branch updates an exising flow and, if applicable, terminates the flow.
+						// NOTE. This branch *must* return.
+						if !oooPacket || (flow.EndTime.Before(mp.timestamp)) {
+							flow.EndTime = mp.timestamp
+						}
+						flow.NumPackets++
+						flow.NumBytes += uint64(mp.packetLength)
+						flow.NumPayloadBytes += uint64(mp.payloadLength)
+						terminateFlow = false
+						if mp.protocol == layers.IPProtocolTCP {
+							if (mp.tcpFlags&(FIN|ACK) == (FIN | ACK)) || (mp.tcpFlags&RST == RST) {
+								// Termination reason 1
+								terminateFlow = true
+							}
+							flow.RestTCPFlags |= mp.tcpFlags
+							flow.LastTCPSequence = mp.tcpSeq
+						}
+						if terminateFlow {
+							if config.Debug.PrintFlows {
+								fmt.Println(flow.String())
+							}
+							delete(flowMap, hash)
+							idleCache.Remove(hash)
+							if config.FilterSmallFlows && (flow.Tuple.Proto == layers.IPProtocolTCP) &&
+								(flow.NumPackets < 4) {
+								continue Loop
+							}
+							out <- flow
+						} else {
+							flowMap[hash] = flow
+							idleCache.Update(hash, mp.timestamp.Add(idleTimeout))
+						}
+						continue Loop
+					}
+				}
+				// Define a new flow.
+				numFlows++
+				flow.ID = numFlows
+				flow.Tuple = tuple
+				flow.StartTime = mp.timestamp
+				flow.EndTime = mp.timestamp
+				flow.ActiveTimeout = mp.timestamp.Add(activeTimeout)
+				flow.ClosureReason = ClosureNormal
+				flow.NumPackets = 1
+				flow.NumBytes = uint64(mp.packetLength)
+				flow.NumPayloadBytes = uint64(mp.payloadLength)
+				flow.FirstTCPFlags = mp.tcpFlags
+				flow.RestTCPFlags = 0
+				flow.FirstTCPSequence = mp.tcpSeq
+				flow.LastTCPSequence = mp.tcpSeq
+
+				idle.hash = hash
+				idle.expiry = mp.timestamp.Add(idleTimeout)
+
+				// Next, check the flow map and ensure there is room to potentially add a new
+				// record. We the map is at capacity, pop the oldest flow.
+				// NOTE: Make sure the map and idle cache are the same size!
+				// TODO: Map and idle queue resizing (EXPENSIVE)
+				if uint64(len(flowMap)) == capacity {
+					if len(flowMap) != len(idleCache) {
+						log.Panicf("Flow map (len=%v) and idle timeout cache (len=%v, cap=%v) are out of sync after %v packets and %v flows!",
+							len(flowMap), len(idleCache), cap(idleCache), stats.TotalPackets, numFlows)
+					}
+					e := idleCache.Pop()
+					if config.Debug.PrintFlows {
+						log.Println("Capacity alert! Early close for: ", flowMap[e.hash].String())
+					}
+					delete(flowMap, e.hash)
+				}
+				flowMap[hash] = flow
+				idleCache.Add(idle)
+			}
+		}
+		// Go randomizes key iteration order, so we need to grab the keys, sort them, and access
+		// the values in sorted order.  This is ok here because it's the end of the goroutine and
+		// there are presumably no more packets to process.
+		var keys Uint64Array
+		for k := range flowMap {
+			keys = append(keys, k)
+		}
+		sort.Sort(keys)
+		for _, k := range keys {
+			if config.Debug.PrintFlows {
+				fmt.Println(flowMap[k])
+			}
+			out <- flowMap[k]
+		}
+		stats.TotalFlows += numFlows
+		wg.Done()
+	}()
+	return out
 }

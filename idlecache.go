@@ -1,11 +1,11 @@
 // Copyright (c) 2016 Threat Trace, LLC. All rights reserved.
 //
-// NOTE: This is a *very* unoptimized implementation of an idle flow cache for our use case. It is
+// FIXME: This is a *very* unoptimized implementation of an idle flow cache for our use case. It is
 // a simple get-it-done approach using slices with terrible performance because of the massive amount
 // slice resizing.  *DO NOT USE THIS VERSION BEYOND THE EARLY PROTOTYPE STAGE*
 //
-// TODO: A potentially better approach is a custom linked list that implicitly stores pointers with
-// the elements, i.e. {next, hash, expiry}, with element allocations from a memory pool of size
+// A potentially better approach is a custom linked list that implicitly stores pointers with the
+// elements, i.e. {next, hash, expiry}, with element allocations from a memory pool of size
 // capacity. Go's `container/list` is not an option because elements are "external" to the list and
 // use a "Value interface" to access the element.  Heap allocations (and assocaited GC activity) and
 // general interfaces are not really our use case for an IdleCache.
@@ -20,22 +20,22 @@ package main
 
 import "time"
 
-// IdleEntry is an entry in an idle flow cache.
-type IdleEntry struct {
+// IdleElem is an entry in an idle flow cache.
+type IdleElem struct {
 	hash   uint64
 	expiry time.Time
 }
 
 // IdleCache is a fixed-size cache based on slices.  It does not resize.
-type IdleCache []IdleEntry
+type IdleCache []IdleElem
 
 // NewIdleCache returns a new cache with the given capacity.
 func NewIdleCache(capacity uint64) IdleCache {
-	return make([]IdleEntry, 0, capacity)
+	return make([]IdleElem, 0, capacity)
 }
 
 // Add adds an cache entry corresponding to `hash` with an expiration time of `expiry`.
-func (q *IdleCache) Add(e IdleEntry) bool {
+func (q *IdleCache) Add(e IdleElem) bool {
 	if len(*q) == cap(*q) {
 		return false
 	}
@@ -44,7 +44,7 @@ func (q *IdleCache) Add(e IdleEntry) bool {
 }
 
 // Pop removes the first entry from the cache.
-func (q *IdleCache) Pop() (e IdleEntry) {
+func (q *IdleCache) Pop() (e IdleElem) {
 	e = (*q)[0]
 	*q = (*q)[1:]
 	return
@@ -77,9 +77,10 @@ func (q *IdleCache) Update(hash uint64, expiry time.Time) bool {
 }
 
 // Purge removes all entries from the cache that are older than `time`.
-func (q *IdleCache) Purge(time time.Time) (count int) {
+func (q *IdleCache) Purge(time time.Time, cb func(uint64)) (count int) {
 	for i := range *q {
-		if (*q)[i].expiry.After(time) {
+		if (*q)[i].expiry.Before(time) {
+			cb((*q)[i].hash)
 			(*q) = (*q)[i:]
 			return
 		}

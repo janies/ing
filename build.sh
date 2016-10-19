@@ -1,10 +1,13 @@
 #!/bin/bash
 
+if [ -f './ing' ]; then
+    rm -rf './ing'
+fi
+
 # See semver.org for instructions on setting VERSION correctly
 VERSION=0.1.0
-
 go build -ldflags \
-    "-X main.version=${VERSION} -X main.buildTime=`date -u +%Y-%m-%d_%I:%M:%S%p` -X main.gitHash=`git rev-parse HEAD`"
+    "-X main.config.Version=${VERSION} -X main.config.BuildTime=`date -u +%Y-%m-%d_%I:%M:%S%p` -X main.config.GitHash=`git rev-parse HEAD`"
 
 echo ""
 echo "     ************************************************"

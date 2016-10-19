@@ -5,9 +5,9 @@ package main
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/signal"
-	"sort"
 	"syscall"
 	"time"
 
@@ -22,17 +22,30 @@ import (
 const numLayers = 4
 
 var (
-	eth     layers.Ethernet             // layer 1
-	dot1q   layers.Dot1Q                // layer 1
-	ip4     layers.IPv4                 // layer 2
-	ip6     layers.IPv6                 // layer 2
-	ipv6ext layers.IPv6ExtensionSkipper // layer 2
-	tcp     layers.TCP                  // layer 3
-	udp     layers.UDP                  // layer 3
-	icmp    layers.ICMPv4               // layer 3
-	icmp6   layers.ICMPv6               // layer 3
-	payload gopacket.Payload            // layer 4
+	eth     layers.Ethernet             // gopacket layer 1
+	dot1q   layers.Dot1Q                // gopacket layer 1
+	ip4     layers.IPv4                 // gopacket layer 2
+	ip6     layers.IPv6                 // gopacket layer 2
+	ipv6ext layers.IPv6ExtensionSkipper // gopacket layer 2
+	icmp    layers.ICMPv4               // gopacket layer 2
+	icmp6   layers.ICMPv6               // gopacket layer 2
+	tcp     layers.TCP                  // gopacket layer 3
+	udp     layers.UDP                  // gopacket layer 3
+	dns     layers.DNS                  //gopacket layer 4
+	payload gopacket.Payload            // gopacket layer 4
 )
+
+// TCP flags as constants
+const (
+	FIN byte = 0x01
+	SYN byte = 0x02
+	RST byte = 0x04
+	PSH byte = 0x08
+	ACK byte = 0x10
+	URG byte = 0x20
+)
+
+var zeroByteArray = [16]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 
 // MetaPacket captures everything about a packet that we are about in downstream computations. It
 // is a flat data structure with minimal composition.
@@ -50,218 +63,194 @@ type MetaPacket struct {
 	tcpSeq        uint32            // TCP sequence number if packet is TCP
 }
 
-// Summary statistics variables
-var (
-	numBytes     uint64
-	numDecoded   uint64
-	numErrors    uint64
-	numTruncated uint64
-	totalPackets uint64
-	totalFlows   uint64
-)
+func printMetaPacket(mp MetaPacket) {
+	fmt.Printf("%s ", mp.timestamp.Format("2006-01-02 15:04:05.00000"))
 
-// TCP flags as constants
-const (
-	FIN byte = 0x01
-	SYN byte = 0x02
-	RST byte = 0x04
-	PSH byte = 0x08
-	ACK byte = 0x10
-	URG byte = 0x20
-)
-
-var zeroByteArray = [16]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-
-// PrintMetaPacket pretty-prints a MetaPacket type to standard output.
-func PrintMetaPacket(mp MetaPacket) {
-	fmt.Printf("{id: %d, ts: %s", mp.id, mp.timestamp.String())
-	if mp.sip.IsIPV4() {
-		fmt.Printf(", ip: %v, sip: %s, dip: %s, proto: %s", 4, mp.sip.String(), mp.dip.String(),
-			mp.protocol.String())
-	} else {
-		fmt.Printf(", ip: %v, sip: %s, dip: %s, proto: %s", 6, mp.sip.String(), mp.dip.String(),
-			mp.protocol.String())
-	}
 	switch mp.protocol {
 	case layers.IPProtocolTCP:
 		fallthrough
 	case layers.IPProtocolUDP:
-		fmt.Printf(", sport: %d, dport: %d", mp.sport, mp.dport)
+		if mp.sip.Version == 4 {
+			fmt.Printf(" %s %s:%d -> %s:%d", mp.protocol.String(), mp.sip.String(), mp.sport,
+				mp.dip.String(), mp.dport)
+		} else {
+			fmt.Printf(" %s %s.%d -> %s.%d", mp.protocol.String(), mp.sip.String(), mp.sport,
+				mp.dip.String(), mp.dport)
+		}
 	case layers.IPProtocolICMPv4:
-		fmt.Printf(", typecode: %v", layers.ICMPv4TypeCode(mp.sport).String())
+		fmt.Printf(" %s %s -> %s, typecode: %v", mp.protocol.String(),
+			mp.sip.String(), mp.dip.String(), layers.ICMPv4TypeCode(mp.sport).String())
 	case layers.IPProtocolICMPv6:
-		fmt.Printf(", typecode: %v", layers.ICMPv6TypeCode(mp.sport).String())
+		fmt.Printf(" %s %s -> %s, typecode: %v", mp.protocol.String(),
+			mp.sip.String(), mp.dip.String(), layers.ICMPv6TypeCode(mp.sport).String())
 	}
 	fmt.Printf(", payload: %v", mp.payloadLength)
-	fmt.Println("}")
+	fmt.Println("")
 }
 
-// ProcessPackets reads packet from a source until either an EOF (PCAP files) or a termination
-// signal (live network device).
-func ProcessPackets(handle *pcap.Handle) {
-	// Set up our channels for sending decoded layers to handleDecodedLayers (a worker goroutine).
-	// Two channels are used: layerChan is a channel for sending decoded packets to the worker, and
-	// doneChan is used by the worker to indicate it has finished handling all decoded
-	// layers in layerChan.  The allows us to shut down gracefully by closing layerChan, letting the
-	// worker finish, and wrapping up any loose ends.
-	printChan := make(chan MetaPacket, 256)
-	donePrintChan := make(chan bool, 1)
-	go func() {
-		for p := range printChan {
-			if DebugPrintPackets {
-				PrintMetaPacket(p)
-			}
-		}
-		donePrintChan <- true
-	}()
+// Summary statistics variables
+var stats struct {
+	NumBytes     uint64
+	NumDecoded   uint64
+	NumTruncated uint64
+	TotalPackets uint64
+	TotalFlows   uint64
+}
 
-	// This block sets up a flow aggregator in a goroutine.
-	flowChan := make(chan MetaPacket, 100)
-	doneFlowChan := make(chan bool, 1)
-	go func() {
-		flowSet := NewFlowSet(ActiveTimeout, IdleTimeout, 10000000)
-		for p := range flowChan {
-			// First, purge idle flows every idlePacketDuration packets.
-			if totalPackets%IdlePacketDuration == 0 {
-				flowSet.Idle.Purge(p.timestamp)
-			}
-			flowSet.Add(p)
-		}
-		// Go randomizes key iteration order, so we need to grab the keys, sort them, and access
-		// the values in sorted order.  This is ok here because it's the end of the goroutine and
-		// there are presumably no more packets to process.
-		var keys Uint64Array
-		for k := range flowSet.FlowMap {
-			keys = append(keys, k)
-		}
-		sort.Sort(keys)
-		for _, k := range keys {
-			if DebugPrintFlows {
-				fmt.Println(flowSet.FlowMap[k])
-			}
-			flowSet.writer.Write(flowSet.FlowMap[k])
-		}
-		totalFlows += flowSet.NumFlows
-		flowSet.Close()
-		doneFlowChan <- true
-	}()
-
-	// Set up a goroutine to handle shutdown signals on signalChan. This lets the program gracefully
-	// shut down on ^C or SIGTERM.
-	shutdownChan := make(chan bool, 1) // Channel that alerts on SIGTERM or SIGINT
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-signalChan
-		fmt.Println("Received ^C. Gracefully shutting down.")
-		shutdownChan <- true
-	}()
-
-	// This is the main packet processing loop. It reads packets from the source, decodes them
-	// into layers, and passes them to the worker via the layerChan channel.
-	var mp MetaPacket
-	decoded := make([]gopacket.LayerType, 0, numLayers)
-	parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ip4, &ip6,
-		&ipv6ext, &tcp, &udp, &icmp, &icmp6, &payload)
-
-Loop:
-	for {
-		select {
-		case <-shutdownChan:
-			break Loop
-		default:
-			data, ci, err := handle.ZeroCopyReadPacketData()
-			if err == io.EOF {
-				// All packets from a PCAP file have been read (not applicable to a live device).
-				break Loop
-			} else if err != nil {
-				// We have an error reading a packet. Skip it.
-				continue Loop
-			}
-
-			// We have a valid packet, so parse it based on our layer parser.
-			totalPackets++
-			if err = parser.DecodeLayers(data, &decoded); err != nil {
-				// This error means we have a packet that does not conform to the layers we expected
-				// to receive.  That could mean we have something interesting to investigate.
-				// TODO: We need to provide an analytic or forensics capability for this case. Bytes
-				// in `data` describe the packet and can be dumped to a file for further analysis.
-				numErrors++
-				continue Loop
-			}
-			numDecoded++
-			numBytes += uint64(len(data))
-
-			if parser.Truncated {
-				// We have a truncated packet. Skip it for now.
-				// NOTE: How should we handle truncated packets?
-				numTruncated++
-				continue Loop
-			}
-
-			// We are ready to send a Packet to packetChan, but we need to copy values, not copy
-			// references to values. We deep copy the slices we are interested in preserving across
-			// the channel.
-			// NOTE: This may be a profiling and optimization target.
-			mp.id = numDecoded
-			mp.timestamp = ci.Timestamp
-			mp.packetLength = uint16(len(data))
-			for _, typ := range decoded {
-				switch typ {
-				case layers.LayerTypeIPv4:
-					mp.sip.CopyFromNetIP(ip4.SrcIP, true)
-					mp.dip.CopyFromNetIP(ip4.DstIP, true)
-				case layers.LayerTypeIPv6:
-					mp.sip.CopyFromNetIP(ip6.SrcIP, false)
-					mp.dip.CopyFromNetIP(ip6.DstIP, false)
-				case layers.LayerTypeTCP:
-					mp.sport = uint16(tcp.SrcPort)
-					mp.dport = uint16(tcp.DstPort)
-					mp.protocol = layers.IPProtocolTCP
-					mp.tcpSeq = tcp.Seq
-					mp.tcpFlags = 0x00
-					if tcp.FIN {
-						mp.tcpFlags |= FIN
-					}
-					if tcp.SYN {
-						mp.tcpFlags |= SYN
-					}
-					if tcp.RST {
-						mp.tcpFlags |= RST
-					}
-					if tcp.PSH {
-						mp.tcpFlags |= PSH
-					}
-					if tcp.ACK {
-						mp.tcpFlags |= ACK
-					}
-					if tcp.URG {
-						mp.tcpFlags |= URG
-					}
-				case layers.LayerTypeUDP:
-					mp.sport = uint16(udp.SrcPort)
-					mp.dport = uint16(udp.DstPort)
-					mp.protocol = layers.IPProtocolUDP
-				case layers.LayerTypeICMPv4:
-					mp.sport = uint16(icmp.TypeCode)
-					mp.dport = 0
-					mp.protocol = layers.IPProtocolICMPv4
-				case layers.LayerTypeICMPv6:
-					mp.sport = uint16(icmp6.TypeCode)
-					mp.dport = 0
-					mp.protocol = layers.IPProtocolICMPv6
-				case gopacket.LayerTypePayload:
-					mp.payloadLength = uint16(len(payload))
-				}
-			}
-			printChan <- mp
-			flowChan <- mp
-		}
+// FilterTCPFlags returns true one of the following TCP flag combinations exists.
+// 1. SYN FIN.
+// 2. A FIN without an ACK flag.
+// 4. "Null" packets (no flags set at all).
+func FilterTCPFlags(tcp layers.TCP) bool {
+	switch {
+	case tcp.SYN && tcp.FIN:
+		return true
+	case !tcp.FIN && !tcp.ACK:
+		return true
+	case !tcp.FIN && !tcp.SYN && !tcp.RST && !tcp.PSH && !tcp.ACK && !tcp.URG:
+		return true
+	default:
+		return false
 	}
-	close(printChan)
-	close(flowChan)
-	<-donePrintChan
-	<-doneFlowChan
-	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, %v errors, and %v truncated.\n",
-		totalPackets, numBytes, totalFlows, numDecoded, numErrors, numTruncated)
+}
+
+// GeneratePackets ...
+func GeneratePackets(done <-chan struct{}, handle *pcap.Handle) <-chan MetaPacket {
+	// Set up a goroutine to handle shutdown signals. This allows the program to gracefully
+	// shut down on ^C or SIGTERM.
+	inSignal := make(chan os.Signal, 1)
+	shutdown := make(chan bool, 1)
+	signal.Notify(inSignal, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-inSignal
+		fmt.Println("\nReceived ^C. Gracefully shutting down.")
+		shutdown <- true
+	}()
+
+	out := make(chan MetaPacket, 256)
+	go func() {
+		defer close(out)
+		var mp MetaPacket
+		decoded := make([]gopacket.LayerType, 0, numLayers)
+		parser := gopacket.NewDecodingLayerParser(layers.LayerTypeEthernet, &eth, &dot1q, &ip4,
+			&ip6, &ipv6ext, &tcp, &udp, &icmp, &icmp6, &dns, &payload)
+
+	Loop:
+		for {
+			select {
+			case <-done:
+			case <-shutdown:
+				break Loop
+			default:
+				data, ci, err := handle.ZeroCopyReadPacketData()
+				if err == io.EOF {
+					// All packets from a PCAP file have been read (not applicable to a live device).
+					break Loop
+				} else if err != nil {
+					// We have an error reading a packet. Skip it.
+					continue Loop
+				}
+
+				// We have a valid packet, so parse it based on our layer parser.
+				stats.TotalPackets++
+				if err = parser.DecodeLayers(data, &decoded); err != nil {
+					// This error means we have a packet that does not conform to the layers we
+					// expected to receive.  That could mean we have something interesting to
+					// investigate.
+					//
+					// TODO: We need to provide an analytic or forensics capability for this case.
+					// Bytes in `data` describe the packet and can be dumped to a file for further
+					// analysis.
+					if config.Debug.PrintErrors {
+						log.Println(err)
+					}
+					continue Loop
+				}
+				stats.NumDecoded++
+				stats.NumBytes += uint64(len(data))
+
+				if parser.Truncated {
+					// We have a truncated packet. Skip it for now.
+					// NOTE: How should we handle truncated packets?
+					stats.NumTruncated++
+					//continue Loop
+				}
+
+				// We are ready to send a Packet to packetChan, but we need to copy values, not copy
+				// references to values. We deep copy the slices we are interested in preserving across
+				// the channel.
+				// IDEA: This may be a profiling and optimization target.
+				mp.id = stats.NumDecoded
+				mp.timestamp = ci.Timestamp
+				mp.packetLength = uint16(len(data))
+				for _, typ := range decoded {
+					switch typ {
+					case layers.LayerTypeIPv4:
+						// At this point, we know that 'in' is defragmented.
+						mp.sip.CopyFromNetIP(ip4.SrcIP, true)
+						mp.dip.CopyFromNetIP(ip4.DstIP, true)
+					case layers.LayerTypeIPv6:
+						mp.sip.CopyFromNetIP(ip6.SrcIP, false)
+						mp.dip.CopyFromNetIP(ip6.DstIP, false)
+					case layers.LayerTypeTCP:
+						mp.sport = uint16(tcp.SrcPort)
+						mp.dport = uint16(tcp.DstPort)
+						mp.protocol = layers.IPProtocolTCP
+						mp.tcpSeq = tcp.Seq
+						mp.tcpFlags = 0x00
+						if config.FilterTCPFlags && FilterTCPFlags(tcp) {
+							log.Println("Dropping packet with suspicious flags: ", tcp)
+							continue Loop
+						}
+						if tcp.FIN {
+							mp.tcpFlags |= FIN
+						}
+						if tcp.SYN {
+							mp.tcpFlags |= SYN
+						}
+						if tcp.RST {
+							mp.tcpFlags |= RST
+						}
+						if tcp.PSH {
+							mp.tcpFlags |= PSH
+						}
+						if tcp.ACK {
+							mp.tcpFlags |= ACK
+						}
+						if tcp.URG {
+							mp.tcpFlags |= URG
+						}
+					case layers.LayerTypeUDP:
+						mp.sport = uint16(udp.SrcPort)
+						mp.dport = uint16(udp.DstPort)
+						mp.protocol = layers.IPProtocolUDP
+					case layers.LayerTypeICMPv4:
+						mp.sport = uint16(icmp.TypeCode)
+						mp.dport = 0
+						mp.protocol = layers.IPProtocolICMPv4
+					case layers.LayerTypeICMPv6:
+						mp.sport = uint16(icmp6.TypeCode)
+						mp.dport = 0
+						mp.protocol = layers.IPProtocolICMPv6
+					case layers.LayerTypeDNS: // Treat this like a payload
+						fallthrough
+					case gopacket.LayerTypePayload:
+						mp.payloadLength = uint16(len(payload))
+					}
+				}
+				out <- mp
+				if config.Debug.PrintPackets {
+					printMetaPacket(mp)
+				}
+				mp.sport = 0
+				mp.dport = 0
+				mp.protocol = 0
+				mp.payloadLength = 0
+				mp.tcpFlags = 0
+				mp.tcpSeq = 0
+			}
+		}
+		wg.Done()
+	}()
+	return out
 }
