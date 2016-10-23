@@ -5,6 +5,7 @@ A packet processor and metadata collected for industrial control system (ISC) ne
 ## Dependencies
 
 * [gopacket](https://github.com/google/gopacket) (`go get github.com/google/gopacket`)
+* [lumberjack](https://github.com/natefinch/lumberjack) for rolling logs
 * libpcap and libpcap-devel
 
 
