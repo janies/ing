@@ -9,7 +9,7 @@ import (
 
 // IPAddress ...
 type IPAddress struct {
-	Version int
+	Version byte
 	Address [16]byte
 }
 
