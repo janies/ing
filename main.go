@@ -33,6 +33,7 @@ var config struct {
 	FilterTCPFlags         bool   // Drop and report packets with abnormal TCP flag combinations
 	FilterSmallFlows       bool   // Filter out small TCP flows with 1-3 packets
 	Debug                  struct {
+		DropFlows    bool // Don't output flows to a file; just drop them
 		PrintErrors  bool // Print errors
 		PrintFlows   bool // print every flow in short form
 		PrintPackets bool // print every packet in short form
@@ -61,6 +62,7 @@ func main() {
 	flag.IntVar(&config.SnapLen, "snaplen", 65536, "Read snaplen bytes from each packet")
 	flag.BoolVar(&config.FilterTCPFlags, "filter-tcp-flags", false, "Drop and report suspicious TCP flag combinations")
 	flag.BoolVar(&config.FilterSmallFlows, "filter-small-flows", false, "Don't output TCP flows with 1-3 packets")
+	flag.BoolVar(&config.Debug.DropFlows, "debug-drop-flows", false, "Don't write flows to files")
 	flag.BoolVar(&config.Debug.PrintErrors, "debug-print-errors", false, "Print errors")
 	flag.BoolVar(&config.Debug.PrintFlows, "debug-print-flows", false, "Print flows in short form")
 	flag.BoolVar(&config.Debug.PrintPackets, "debug-print-packets", false, "Print packets in short form")
@@ -111,7 +113,11 @@ func main() {
 	wg.Add(3) // NOTE: number of computations that have goroutines; ensure they call wg.Done()
 	inPackets := GeneratePackets(done, packetHandle)
 	inFlows := AssignFlows(done, inPackets)
-	WriteFlows(done, inFlows)
+	if config.Debug.DropFlows {
+		DropFlows(done, inFlows)
+	} else {
+		WriteFlows(done, inFlows)
+	}
 	wg.Wait()
 
 	fmt.Printf("Processed %v packets (%v bytes) in %v flows with %v decoded, and %v truncated.\n",
