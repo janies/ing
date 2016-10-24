@@ -27,19 +27,20 @@ func fnvHashSlice(b []byte) (h uint64) {
 	return
 }
 
-// FlowTuple is a standard 5-tuple for IP flows
-type FlowTuple struct {
-	Sip   IPAddress
-	Dip   IPAddress
-	Sport uint16
-	Dport uint16
-	Proto layers.IPProtocol
+// FlowKey is a standard 5-tuple plus a Vlan ID for 802.1q networks
+type FlowKey struct {
+	Sip    IPAddress
+	Dip    IPAddress
+	Sport  uint16
+	Dport  uint16
+	Proto  layers.IPProtocol
+	VlanID uint16
 }
 
-// Hash provides a quick non-cryptographic hash value of a FlowTuple.
+// Hash provides a quick non-cryptographic hash value of a FlowKey.
 // Do not use for persistent key-value storage because it may change in future
 // versions.
-func (ft *FlowTuple) Hash() (h uint64) {
+func (ft *FlowKey) Hash() (h uint64) {
 	h = fnvHashSlice(ft.Sip.Address[:]) + fnvHashSlice(ft.Dip.Address[:])
 	h ^= uint64(ft.Sport)
 	h *= fnvPrime
@@ -47,19 +48,12 @@ func (ft *FlowTuple) Hash() (h uint64) {
 	h *= fnvPrime
 	h ^= uint64(ft.Proto)
 	h *= fnvPrime
+	h ^= uint64(ft.VlanID)
+	h *= fnvPrime
 	return
 }
 
-// Copy ...
-func (ft *FlowTuple) Copy(dst *FlowTuple) {
-	dst.Sip = ft.Sip
-	dst.Dip = ft.Dip
-	dst.Sport = ft.Sport
-	dst.Dport = ft.Dport
-	dst.Proto = ft.Proto
-}
-
-func (ft FlowTuple) String() string {
+func (ft FlowKey) String() string {
 	switch ft.Proto {
 	case layers.IPProtocolTCP:
 		fallthrough
@@ -86,7 +80,7 @@ func (ft FlowTuple) String() string {
 // Flow is a complete description of a netflow session.
 type Flow struct {
 	ID               uint64
-	Tuple            FlowTuple
+	Key              FlowKey
 	StartTime        time.Time
 	EndTime          time.Time
 	ActiveTimeout    time.Time
@@ -98,6 +92,7 @@ type Flow struct {
 	FirstTCPSequence uint32
 	LastTCPSequence  uint32
 	ClosureReason    int
+	SawFINOnly       bool
 }
 
 // Reasons for flow closure
@@ -119,11 +114,11 @@ func (f *Flow) HasRSTFlag() bool {
 	return (f.FirstTCPFlags&RST == RST) || (f.RestTCPFlags&RST == RST)
 }
 
-// Equal uses the Equaler interface because we only care that the flow tuples are equal.
+// Equal uses the Equaler interface because we only care that the flow keys are equal.
 // NOTE: Strictly, we may not need the Equaler interace if we commit to IPAddress without slices.
 func (f Flow) Equal(x Equaler) bool {
 	if other, ok := x.(Flow); ok {
-		return f.Tuple == other.Tuple
+		return f.Key == other.Key
 	}
 	return false
 }
@@ -132,10 +127,18 @@ func (f Flow) String() string {
 	return fmt.Sprintf("%s - %s (%s) %s (count: %v, bytes: %v, payload_bytes: %v)",
 		f.StartTime.UTC().Format("2006-01-02 15:04:05.00000"), f.EndTime.UTC().Format("15:04:05.00000"),
 		time.Duration(f.EndTime.Sub(f.StartTime)),
-		f.Tuple.String(), f.NumPackets, f.NumBytes, f.NumPayloadBytes)
+		f.Key.String(), f.NumPackets, f.NumBytes, f.NumPayloadBytes)
 }
 
-// AssignFlows ...
+// AssignFlows is the main computation for assigning packets to flows and terminating flows based
+// on specific termination conditions:
+// 1. A TCP session ends normally with FIN or a RST flag. We track if we see a FIN without an ACK
+//    since it may be considered anomalous.
+// 2. The map is full (terminate the oldest flows to free up resources).
+// 3. See a packet after ActiveTimeout seconds.
+// 4. A flow doesn't see a packet after IdleTimeout seconds (PurgeIdleFlows() receiver method).
+//
+// TODO: Implement flow termination logic for reasons 2.
 func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 	out := make(chan Flow, 256)
 	go func() {
@@ -144,12 +147,14 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 			capacity               = 10000000
 			oooBound time.Duration = 5 * time.Microsecond
 		)
+		// These are cache variables that help us avoid allocating new variables and minimize GC
+		// activity in the goroutine.
 		var (
 			flowMap          = make(map[uint64]Flow, capacity)
 			idleCache        = NewIdleCache(capacity)
 			currentTimestamp time.Time
 			numFlows         uint64
-			tuple            FlowTuple
+			key              FlowKey
 			flow             Flow
 			idle             IdleElem
 			hash             uint64
@@ -167,14 +172,6 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 			case <-done:
 				break Loop
 			default:
-				// Reasons for terminating a flow:
-				// 1. A TCP session ends normally (see a [FIN,ACK] or a [RST] flag).
-				// 2. The map is full (terminate the oldest flows).
-				// 3. See a packet after ActiveTimeout seconds.
-				// 4. Don't see a packet after IdleTimeout seconds (PurgeIdleFlows() receiver method).
-				//
-				// TODO: Implement flow termination logic for reasons 2.
-
 				// Purge inactive flows from the map and idle cache.  We make things easy and use a
 				// closure for the callback to IdleCache.Purge().
 				idleCache.Purge(mp.timestamp, func(hash uint64) {
@@ -184,7 +181,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						}
 						flow.ClosureReason = ClosureIdleTimeout
 						delete(flowMap, hash)
-						if config.FilterSmallFlows && (flow.Tuple.Proto == layers.IPProtocolTCP) &&
+						if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
 							(flow.NumPackets < 4) {
 							return
 						}
@@ -204,14 +201,25 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 					currentTimestamp = mp.timestamp
 				}
 
-				// Construct a flow tuple and its hash.
+				// Construct a flow key and its hash.
 				// REVIEW: This might be inefficient. Take a look at the sync/atomic Value type.
-				tuple.Sip = mp.sip
-				tuple.Dip = mp.dip
-				tuple.Sport = mp.sport
-				tuple.Dport = mp.dport
-				tuple.Proto = mp.protocol
-				hash = tuple.Hash()
+				key.Sip = mp.sip
+				key.Dip = mp.dip
+				key.Sport = mp.sport
+				key.Dport = mp.dport
+				key.Proto = mp.protocol
+				key.VlanID = mp.vlanid
+				hash = key.Hash()
+
+				// Look up the key in the flow map.
+				// If it returns a hit, then we check if the packet triggers an active timeout
+				// termination. If so, we send the current flow with the key on the output channel
+				// and fall out of the branch to the code below, thus creating another flow with
+				// this key.  If the packet does not cause an active timeout, we may still terminate
+				// the flow if the packet is a TCP packet and has [FIN, ACK] or [RST] flags set.
+				// Otherwise, we update the flow and return.
+				// If there is no hit in the map table for this key, we create a new flow and add
+				// it to the table.
 				if flow, ok = flowMap[hash]; ok {
 					// Flow exists in the set. Update and terminate, if necessary.
 					// First, check for an active timeout for the flow.
@@ -223,16 +231,18 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						}
 						delete(flowMap, hash)
 						idleCache.Remove(hash)
-						if config.FilterSmallFlows && (flow.Tuple.Proto == layers.IPProtocolTCP) &&
+						if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
 							(flow.NumPackets < 4) {
+							// This condition filters out small flows if the config is set.
 							continue Loop
 						}
 						out <- flow
 						// NOTE: Since this is a continuation of a flow, we create a new flow by
 						// dropping out of this branch. DO NOT RETURN.
 					} else {
-						// This branch updates an exising flow and, if applicable, terminates the flow.
-						// NOTE. This branch *must* return.
+						// This branch updates an exising flow entry and, if applicable, terminates
+						// the flow if the packet is TCP and the terminal flags are set.
+						// NOTE. This branch *must* continue the loop.
 						if !oooPacket || (flow.EndTime.Before(mp.timestamp)) {
 							flow.EndTime = mp.timestamp
 						}
@@ -241,9 +251,12 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						flow.NumPayloadBytes += uint64(mp.payloadLength)
 						terminateFlow = false
 						if mp.protocol == layers.IPProtocolTCP {
-							if (mp.tcpFlags&(FIN|ACK) == (FIN | ACK)) || (mp.tcpFlags&RST == RST) {
+							if (mp.tcpFlags&FIN == FIN) || (mp.tcpFlags&RST == RST) {
 								// Termination reason 1
 								terminateFlow = true
+								if (mp.tcpFlags&FIN == FIN) && (mp.tcpFlags&ACK == 0x00) {
+									flow.SawFINOnly = true
+								}
 							}
 							flow.RestTCPFlags |= mp.tcpFlags
 							flow.LastTCPSequence = mp.tcpSeq
@@ -254,8 +267,9 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 							}
 							delete(flowMap, hash)
 							idleCache.Remove(hash)
-							if config.FilterSmallFlows && (flow.Tuple.Proto == layers.IPProtocolTCP) &&
+							if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
 								(flow.NumPackets < 4) {
+								// This condition filters out small flows if the config is set.
 								continue Loop
 							}
 							out <- flow
@@ -269,11 +283,12 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				// Define a new flow.
 				numFlows++
 				flow.ID = numFlows
-				flow.Tuple = tuple
+				flow.Key = key
 				flow.StartTime = mp.timestamp
 				flow.EndTime = mp.timestamp
 				flow.ActiveTimeout = mp.timestamp.Add(activeTimeout)
 				flow.ClosureReason = ClosureNormal
+				flow.SawFINOnly = false
 				flow.NumPackets = 1
 				flow.NumBytes = uint64(mp.packetLength)
 				flow.NumPayloadBytes = uint64(mp.payloadLength)
@@ -304,6 +319,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				idleCache.Add(idle)
 			}
 		}
+
 		// Go randomizes key iteration order, so we need to grab the keys, sort them, and access
 		// the values in sorted order.  This is ok here because it's the end of the goroutine and
 		// there are presumably no more packets to process.

@@ -61,6 +61,7 @@ type MetaPacket struct {
 	packetLength  uint16            // Number of bytes in the packet (CaptureInfo.Length)
 	tcpFlags      byte              // TCP flags if packet is TCP
 	tcpSeq        uint32            // TCP sequence number if packet is TCP
+	vlanid        uint16            // VLAN ID for 802.1q (assume zero means no VLAN)
 }
 
 func printMetaPacket(mp MetaPacket) {
@@ -185,6 +186,8 @@ func GeneratePackets(done <-chan struct{}, handle *pcap.Handle) <-chan MetaPacke
 				mp.packetLength = uint16(len(data))
 				for _, typ := range decoded {
 					switch typ {
+					case layers.LayerTypeDot1Q:
+						mp.vlanid = dot1q.VLANIdentifier
 					case layers.LayerTypeIPv4:
 						// At this point, we know that 'in' is defragmented.
 						mp.sip.CopyFromNetIP(ip4.SrcIP, true)
@@ -248,6 +251,7 @@ func GeneratePackets(done <-chan struct{}, handle *pcap.Handle) <-chan MetaPacke
 				mp.payloadLength = 0
 				mp.tcpFlags = 0
 				mp.tcpSeq = 0
+				mp.vlanid = 0
 			}
 		}
 		wg.Done()
