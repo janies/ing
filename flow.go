@@ -83,7 +83,6 @@ type Flow struct {
 	Key              FlowKey
 	StartTime        time.Time
 	EndTime          time.Time
-	ActiveTimeout    time.Time
 	NumPackets       uint64
 	NumBytes         uint64
 	NumPayloadBytes  uint64
@@ -93,6 +92,7 @@ type Flow struct {
 	LastTCPSequence  uint32
 	ClosureReason    int
 	SawFINOnly       bool
+	ActiveTimeout    time.Time
 }
 
 // Reasons for flow closure
@@ -144,26 +144,24 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 	go func() {
 		defer close(out)
 		const (
-			capacity               = 10000000
+			capacity               = 1000000
 			oooBound time.Duration = 5 * time.Microsecond
 		)
 		// These are cache variables that help us avoid allocating new variables and minimize GC
 		// activity in the goroutine.
 		var (
-			flowMap          = make(map[uint64]Flow, capacity)
-			idleCache        = NewIdleCache(capacity)
+			flowCache        = NewFlowCache(capacity)
 			currentTimestamp time.Time
 			numFlows         uint64
 			key              FlowKey
 			flow             Flow
-			idle             IdleElem
 			hash             uint64
 			oooPacket        bool
 			ok               bool
-			terminateFlow    bool
-			deltaTimestamp   time.Duration
-			activeTimeout    = time.Duration(config.ActiveTimeout) * time.Second
-			idleTimeout      = time.Duration(config.IdleTimeout) * time.Second
+			//			terminateFlow    bool
+			deltaTimestamp time.Duration
+			activeTimeout  = time.Duration(config.ActiveTimeout) * time.Second
+			idleTimeout    = time.Duration(config.IdleTimeout) * time.Second
 		)
 
 	Loop:
@@ -174,19 +172,16 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 			default:
 				// Purge inactive flows from the map and idle cache.  We make things easy and use a
 				// closure for the callback to IdleCache.Purge().
-				idleCache.Purge(mp.timestamp, func(hash uint64) {
-					if flow, ok = flowMap[hash]; ok {
-						if config.Debug.PrintFlows {
-							fmt.Println(flow.String())
-						}
-						flow.ClosureReason = ClosureIdleTimeout
-						delete(flowMap, hash)
-						if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
-							(flow.NumPackets < 4) {
-							return
-						}
-						out <- flow
+				flowCache.Purge(mp.timestamp, func(flow Flow) {
+					if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
+						(flow.NumPackets < 4) {
+						return
 					}
+					if config.Debug.PrintFlows {
+						fmt.Println(flow.String())
+					}
+					flow.ClosureReason = ClosureIdleTimeout
+					out <- flow
 				})
 
 				// Update the current timestamp
@@ -220,22 +215,21 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				// Otherwise, we update the flow and return.
 				// If there is no hit in the map table for this key, we create a new flow and add
 				// it to the table.
-				if flow, ok = flowMap[hash]; ok {
+				if flow, ok = flowCache.Fetch(hash); ok {
 					// Flow exists in the set. Update and terminate, if necessary.
 					// First, check for an active timeout for the flow.
 					if flow.ActiveTimeout.Before(mp.timestamp) {
 						// Termination reason 3
-						flow.ClosureReason = ClosureActiveTimeout
-						if config.Debug.PrintFlows {
-							fmt.Println(flow.String())
-						}
-						delete(flowMap, hash)
-						idleCache.Remove(hash)
+						flowCache.Remove(hash)
 						if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
 							(flow.NumPackets < 4) {
 							// This condition filters out small flows if the config is set.
 							continue Loop
 						}
+						if config.Debug.PrintFlows {
+							fmt.Println(flow.String())
+						}
+						flow.ClosureReason = ClosureActiveTimeout
 						out <- flow
 						// NOTE: Since this is a continuation of a flow, we create a new flow by
 						// dropping out of this branch. DO NOT RETURN.
@@ -249,34 +243,28 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						flow.NumPackets++
 						flow.NumBytes += uint64(mp.packetLength)
 						flow.NumPayloadBytes += uint64(mp.payloadLength)
-						terminateFlow = false
+
+						//						terminateFlow = false
 						if mp.protocol == layers.IPProtocolTCP {
+							flow.RestTCPFlags |= mp.tcpFlags
+							flow.LastTCPSequence = mp.tcpSeq
+							// Termination reason 1: Normal TCP session ended with FIN or RST
 							if (mp.tcpFlags&FIN == FIN) || (mp.tcpFlags&RST == RST) {
-								// Termination reason 1
-								terminateFlow = true
 								if (mp.tcpFlags&FIN == FIN) && (mp.tcpFlags&ACK == 0x00) {
 									flow.SawFINOnly = true
 								}
-							}
-							flow.RestTCPFlags |= mp.tcpFlags
-							flow.LastTCPSequence = mp.tcpSeq
-						}
-						if terminateFlow {
-							if config.Debug.PrintFlows {
-								fmt.Println(flow.String())
-							}
-							delete(flowMap, hash)
-							idleCache.Remove(hash)
-							if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
-								(flow.NumPackets < 4) {
+								if config.Debug.PrintFlows {
+									fmt.Println(flow.String())
+								}
+								flowCache.Remove(hash)
 								// This condition filters out small flows if the config is set.
-								continue Loop
+								if config.FilterSmallFlows && flow.NumPackets < 4 {
+									continue Loop
+								}
+								out <- flow
 							}
-							out <- flow
-						} else {
-							flowMap[hash] = flow
-							idleCache.Update(hash, mp.timestamp.Add(idleTimeout))
 						}
+						flowCache.Update(flow, hash, mp.timestamp.Add(idleTimeout))
 						continue Loop
 					}
 				}
@@ -296,43 +284,24 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				flow.RestTCPFlags = 0
 				flow.FirstTCPSequence = mp.tcpSeq
 				flow.LastTCPSequence = mp.tcpSeq
-
-				idle.hash = hash
-				idle.expiry = mp.timestamp.Add(idleTimeout)
-
-				// Next, check the flow map and ensure there is room to potentially add a new
-				// record. We the map is at capacity, pop the oldest flow.
-				// NOTE: Make sure the map and idle cache are the same size!
-				// TODO: Map and idle queue resizing (EXPENSIVE)
-				if uint64(len(flowMap)) == capacity {
-					if len(flowMap) != len(idleCache) {
-						log.Panicf("Flow map (len=%v) and idle timeout cache (len=%v, cap=%v) are out of sync after %v packets and %v flows!",
-							len(flowMap), len(idleCache), cap(idleCache), stats.TotalPackets, numFlows)
-					}
-					e := idleCache.Pop()
-					if config.Debug.PrintFlows {
-						log.Println("Capacity alert! Early close for: ", flowMap[e.hash].String())
-					}
-					delete(flowMap, e.hash)
-				}
-				flowMap[hash] = flow
-				idleCache.Add(idle)
+				flowCache.Insert(flow, hash, mp.timestamp.Add(idleTimeout))
 			}
 		}
 
 		// Go randomizes key iteration order, so we need to grab the keys, sort them, and access
 		// the values in sorted order.  This is ok here because it's the end of the goroutine and
-		// there are presumably no more packets to process.
+		// there are presumably no more packets to process, i.e. this is post-processing.
+		// TODO: This is horribly slow. It is an optimization target.
 		var keys Uint64Array
-		for k := range flowMap {
+		for k := range flowCache.flows {
 			keys = append(keys, k)
 		}
 		sort.Sort(keys)
 		for _, k := range keys {
 			if config.Debug.PrintFlows {
-				fmt.Println(flowMap[k])
+				fmt.Println(flowCache.flows[k].flow)
 			}
-			out <- flowMap[k]
+			out <- flowCache.flows[k].flow
 		}
 		stats.TotalFlows += numFlows
 		wg.Done()
