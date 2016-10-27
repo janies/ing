@@ -1,6 +1,7 @@
 # Ing
 
-A packet processor and metadata collected for industrial control system (ISC) networks.
+A packet processor and metadata collector for industrial control system (ISC) and healthcare
+networks.
 
 ## Dependencies
 
@@ -26,6 +27,8 @@ OPTIONS:
     	Active flow timeout in seconds (default 1800)
   -bpf string
     	Berkeley Packet Filter expression
+  -debug-drop-flows
+    	Don't write flows to files
   -debug-print-errors
     	Print errors
   -debug-print-flows
@@ -34,10 +37,12 @@ OPTIONS:
     	Print packets in short form
   -device
     	INPUT is a live network device
+  -filter-small-flows
+    	Don't output TCP flows with 1-3 packets
+  -filter-tcp-flags
+    	Drop and report suspicious TCP flag combinations
   -idle-timeout uint
     	Idle flow timout in seconds (default 300)
-  -ignore-small-flows
-    	Don't output TCP flows with 1-3 packets
   -output-interval uint
     	Output rotation interval in minutes (default 10)
   -output-prefix string

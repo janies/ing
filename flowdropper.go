@@ -7,7 +7,7 @@ import (
 	"log"
 )
 
-// DropFlows is used mainly for performance testing to ignore file writing.  I accepts a flow on
+// DropFlows is used mainly for performance testing to ignore file writing.  It accepts a flow on
 // the input channel, unmarshals it to JSON, and promptly ignores the result.
 func DropFlows(done <-chan struct{}, in <-chan Flow) {
 	go func() {

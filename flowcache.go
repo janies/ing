@@ -20,7 +20,7 @@ var v struct {
 // terminated directly from the flow map.
 type FlowCacheElem struct {
 	flow Flow
-	idle *PickNode
+	iptr *PickNode
 }
 
 // NewFlowCache returns a pointer to an initialized FlowCache with the given capacity.
@@ -47,20 +47,20 @@ func (fc *FlowCache) Insert(f Flow, key uint64, idle time.Time) bool {
 		return false // Key is already in hashmap, so don't enter and return false
 	}
 	v.f.flow = f
-	v.f.idle = fc.idle.PushBack(key, idle)
+	v.f.iptr = fc.idle.PushIn(key, idle)
 	fc.flows[key] = v.f
 	return true
 }
 
 // Update updates a flow and its associated idle timeout value, and returns true if it exists in
 // the cache.  It returns false if the value is not in the cache.
-func (fc *FlowCache) Update(f Flow, key uint64, idle time.Time) bool {
+func (fc *FlowCache) Update(f Flow, key uint64, idleTime time.Time) bool {
 	if v.f, v.ok = fc.flows[key]; !v.ok {
 		return false // Key is not in hashmap, so nothing to update and return false
 	}
-	fc.idle.Pick(v.f.idle)
+	fc.idle.Pick(v.f.iptr)
 	v.f.flow = f
-	v.f.idle = fc.idle.PushBack(key, idle)
+	v.f.iptr = fc.idle.PushIn(key, idleTime)
 	fc.flows[key] = v.f
 	return true
 }
@@ -73,7 +73,7 @@ func (fc *FlowCache) Remove(key uint64) (ok bool) {
 		return false
 	}
 	delete(fc.flows, key)
-	fc.idle.Pick(v.f.idle)
+	fc.idle.Pick(v.f.iptr)
 	return true
 }
 
@@ -88,8 +88,9 @@ func (fc *FlowCache) Fetch(key uint64) (f Flow, ok bool) {
 // Purge cycles through the idle queue, removes flows that have expired, and applies the callback
 // function to each flow value.
 func (fc *FlowCache) Purge(t time.Time, cb func(Flow)) (count int) {
-	for v.iptr = fc.idle.Head; v.iptr != nil; v.iptr = v.iptr.next {
-		if !v.iptr.expiry.Before(t) {
+	for v.iptr = fc.idle.OutPtr; v.iptr != nil; v.iptr = v.iptr.next {
+		if v.iptr.expiry.After(t) {
+			// Assumes the expiry values are in monotonically increasing order in the pick queue.
 			return
 		}
 		cb(fc.flows[v.iptr.key].flow)
@@ -110,7 +111,7 @@ type PickNode struct {
 
 // NewPickQueue returns a new PickQueue
 func NewPickQueue() *PickQueue {
-	return &PickQueue{Head: nil, Tail: nil,
+	return &PickQueue{OutPtr: nil, InPtr: nil,
 		pool: &sync.Pool{New: func() interface{} { return &PickNode{} }}}
 }
 
@@ -120,100 +121,65 @@ func NewPickQueue() *PickQueue {
 // The fields of PickNode hold context necessary for enqueuing and dequeuing elements; the queue
 // has no such logic embedded in its receiver methods.
 type PickQueue struct {
-	Head   *PickNode
-	Tail   *PickNode
-	pool   *sync.Pool
+	OutPtr *PickNode
+	InPtr  *PickNode
 	length uint
+	pool   *sync.Pool
 }
 
-// PopFront returns the key value of the head element in the PickQueue unless the queue is empty.
+// PushIn enqueues a node at the back of a PickQueue with values key and expiry and returns a
+// pointer to the node for reference (presumably in a hashmap).  Nodes are allocated from a
+// sync.Pool, which helps manage the heap and GC. If the GC becomes a chokepoint, then we should
+// look at a slab allocator for nodes.
+func (pq *PickQueue) PushIn(key uint64, expiry time.Time) *PickNode {
+	pn := pq.pool.Get().(*PickNode)
+	pn.key = key
+	pn.expiry = expiry
+	pn.next = nil
+	pn.prev = nil
+
+	if pq.InPtr == nil {
+		pq.OutPtr = pn
+	} else {
+		pq.InPtr.next = pn
+	}
+	pn.prev = pq.InPtr
+	pq.InPtr = pn
+	pq.length++
+	return pn
+}
+
+// PopOut returns the key value of the head element in the PickQueue unless the queue is empty.
 // Also, it returns true is the queue was head-popped and false if the queue was empty since  0 isn't
 // a valid sentinel key value.
-func (pq *PickQueue) PopFront() (key uint64, ok bool) {
-	if pq.Head == nil {
+func (pq *PickQueue) PopOut() (key uint64, ok bool) {
+	if pq.OutPtr == nil {
 		return 0, false // Empty list -- need better return values
 	}
-	v.iptr = pq.Head
+	v.iptr = pq.OutPtr
 	v.key = v.iptr.key
 	pq.Pick(v.iptr)
 	return v.key, true
-}
-
-// PopFront returns the key value of the tail element in the PickQueue unless the queue is empty.
-// Also, it returns true is the queue was tail-popped and false if the queue was empty since
-// 0 isn't a valid sentinel key value.
-func (pq *PickQueue) PopBack() (key uint64, ok bool) {
-	if pq.Tail == nil {
-		return 0, false // Empty list -- need better return values
-	}
-	v.iptr = pq.Tail
-	v.key = v.iptr.key
-	pq.Pick(v.iptr)
-	return v.key, true
-}
-
-// PushFront enqueues a node at the front of a PickQueue with values key and expiry and returns a
-// pointer to the node for reference (presumably in a hashmap).  Nodes are allocated from a
-// sync.Pool, which helps manage the heap and GC. If the GC becomes a chokepoint, then we should
-// look at a slab allocator for nodes.
-func (pq *PickQueue) PushFront(key uint64, expiry time.Time) *PickNode {
-	pn := pq.pool.Get().(*PickNode)
-	pn.key = key
-	pn.expiry = expiry
-	pn.next = nil
-	pn.prev = nil
-
-	if pq.Head == nil {
-		pq.Tail = pn
-	} else {
-		pq.Head.next = pn
-	}
-	pn.prev = pq.Head
-	pq.Head = pn
-	pq.length++
-	return pn
-}
-
-// PushFront enqueues a node at the back of a PickQueue with values key and expiry and returns a
-// pointer to the node for reference (presumably in a hashmap).  Nodes are allocated from a
-// sync.Pool, which helps manage the heap and GC. If the GC becomes a chokepoint, then we should
-// look at a slab allocator for nodes.
-func (pq *PickQueue) PushBack(key uint64, expiry time.Time) *PickNode {
-	pn := pq.pool.Get().(*PickNode)
-	pn.key = key
-	pn.expiry = expiry
-	pn.next = nil
-	pn.prev = nil
-
-	if pq.Tail == nil {
-		pq.Head = pn
-	} else {
-		pq.Tail.prev = pn
-	}
-	pn.next = pq.Tail
-	pq.Tail = pn
-	pq.length++
-	return pn
 }
 
 // Pick removes a node from the PickQueue and returns the node to the sync.Pool.  We assume the
 // node is an element of the PickQueue (i.e. we don't check membership).
 func (pq *PickQueue) Pick(pn *PickNode) {
 	// Only allow picking a double nil node if it is the only node in the list
-	if pn.next == nil && pn.prev == nil && !(pq.Head == pn && pq.Tail == pn) {
+	if pn.next == nil && pn.prev == nil && !(pq.OutPtr == pn && pq.InPtr == pn) {
 		return
 	}
 
 	// Connect prev pointer to next pointer
 	if pn.prev == nil {
-		pq.Tail = pn.next
+		pq.OutPtr = pn.next
 	} else {
 		pn.prev.next = pn.next
 	}
 
 	// Connect next pointer to prev pointer
 	if pn.next == nil {
-		pq.Head = pn.prev
+		pq.InPtr = pn.prev
 	} else {
 		pn.next.prev = pn.prev
 	}

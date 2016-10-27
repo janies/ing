@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"sort"
 	"time"
 
 	"github.com/google/gopacket/layers"
@@ -144,7 +143,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 	go func() {
 		defer close(out)
 		const (
-			capacity               = 1000000
+			capacity               = 10000000 // Ten million is pretty high
 			oooBound time.Duration = 5 * time.Microsecond
 		)
 		// These are cache variables that help us avoid allocating new variables and minimize GC
@@ -152,38 +151,24 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 		var (
 			flowCache        = NewFlowCache(capacity)
 			currentTimestamp time.Time
+			mp               MetaPacket
 			numFlows         uint64
 			key              FlowKey
 			flow             Flow
 			hash             uint64
 			oooPacket        bool
 			ok               bool
-			//			terminateFlow    bool
-			deltaTimestamp time.Duration
-			activeTimeout  = time.Duration(config.ActiveTimeout) * time.Second
-			idleTimeout    = time.Duration(config.IdleTimeout) * time.Second
+			deltaTimestamp   time.Duration
+			activeTimeout    = time.Duration(config.ActiveTimeout) * time.Second
+			idleTimeout      = time.Duration(config.IdleTimeout) * time.Second
 		)
 
 	Loop:
-		for mp := range in {
+		for mp = range in {
 			select {
 			case <-done:
 				break Loop
 			default:
-				// Purge inactive flows from the map and idle cache.  We make things easy and use a
-				// closure for the callback to IdleCache.Purge().
-				flowCache.Purge(mp.timestamp, func(flow Flow) {
-					if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
-						(flow.NumPackets < 4) {
-						return
-					}
-					if config.Debug.PrintFlows {
-						fmt.Println(flow.String())
-					}
-					flow.ClosureReason = ClosureIdleTimeout
-					out <- flow
-				})
-
 				// Update the current timestamp
 				deltaTimestamp = mp.timestamp.Sub(currentTimestamp)
 				oooPacket = false
@@ -195,6 +180,20 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				} else {
 					currentTimestamp = mp.timestamp
 				}
+
+				// Purge inactive flows from the map and idle cache.  We make things easy and use a
+				// closure for the callback to IdleCache.Purge().
+				flowCache.Purge(currentTimestamp, func(flow Flow) {
+					if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
+						(flow.NumPackets < 4) {
+						return
+					}
+					if config.Debug.PrintFlows {
+						fmt.Println(flow.String())
+					}
+					flow.ClosureReason = ClosureIdleTimeout
+					out <- flow
+				})
 
 				// Construct a flow key and its hash.
 				// REVIEW: This might be inefficient. Take a look at the sync/atomic Value type.
@@ -218,8 +217,8 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				if flow, ok = flowCache.Fetch(hash); ok {
 					// Flow exists in the set. Update and terminate, if necessary.
 					// First, check for an active timeout for the flow.
-					if flow.ActiveTimeout.Before(mp.timestamp) {
-						// Termination reason 3
+					if mp.timestamp.After(flow.ActiveTimeout) {
+						// Termination reason 3: Active timeout
 						flowCache.Remove(hash)
 						if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
 							(flow.NumPackets < 4) {
@@ -244,7 +243,6 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						flow.NumBytes += uint64(mp.packetLength)
 						flow.NumPayloadBytes += uint64(mp.payloadLength)
 
-						//						terminateFlow = false
 						if mp.protocol == layers.IPProtocolTCP {
 							flow.RestTCPFlags |= mp.tcpFlags
 							flow.LastTCPSequence = mp.tcpSeq
@@ -258,12 +256,14 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 								}
 								flowCache.Remove(hash)
 								// This condition filters out small flows if the config is set.
-								if config.FilterSmallFlows && flow.NumPackets < 4 {
-									continue Loop
+								if !(config.FilterSmallFlows && flow.NumPackets < 4) {
+									out <- flow
 								}
-								out <- flow
+								continue Loop
 							}
 						}
+						// We update a non-TCP flow or one that did not terminate normally, i.e.
+						// termination reason 1.
 						flowCache.Update(flow, hash, mp.timestamp.Add(idleTimeout))
 						continue Loop
 					}
@@ -276,33 +276,33 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				flow.EndTime = mp.timestamp
 				flow.ActiveTimeout = mp.timestamp.Add(activeTimeout)
 				flow.ClosureReason = ClosureNormal
-				flow.SawFINOnly = false
 				flow.NumPackets = 1
 				flow.NumBytes = uint64(mp.packetLength)
 				flow.NumPayloadBytes = uint64(mp.payloadLength)
-				flow.FirstTCPFlags = mp.tcpFlags
-				flow.RestTCPFlags = 0
-				flow.FirstTCPSequence = mp.tcpSeq
-				flow.LastTCPSequence = mp.tcpSeq
+				if mp.protocol == layers.IPProtocolTCP {
+					flow.FirstTCPFlags = mp.tcpFlags
+					flow.RestTCPFlags = 0
+					flow.FirstTCPSequence = mp.tcpSeq
+					flow.LastTCPSequence = mp.tcpSeq
+					flow.SawFINOnly = false
+				}
 				flowCache.Insert(flow, hash, mp.timestamp.Add(idleTimeout))
 			}
 		}
 
-		// Go randomizes key iteration order, so we need to grab the keys, sort them, and access
-		// the values in sorted order.  This is ok here because it's the end of the goroutine and
-		// there are presumably no more packets to process, i.e. this is post-processing.
-		// TODO: This is horribly slow. It is an optimization target.
-		var keys Uint64Array
-		for k := range flowCache.flows {
-			keys = append(keys, k)
-		}
-		sort.Sort(keys)
-		for _, k := range keys {
-			if config.Debug.PrintFlows {
-				fmt.Println(flowCache.flows[k].flow)
+		// Purge remaining flows from the flow cache.  We make things easy and use a
+		// closure for the callback to IdleCache.Purge().
+		flowCache.Purge(currentTimestamp.Add(activeTimeout), func(flow Flow) {
+			if config.FilterSmallFlows && (flow.Key.Proto == layers.IPProtocolTCP) &&
+				(flow.NumPackets < 4) {
+				return
 			}
-			out <- flowCache.flows[k].flow
-		}
+			if config.Debug.PrintFlows {
+				fmt.Println(flow.String())
+			}
+			flow.ClosureReason = ClosureIdleTimeout
+			out <- flow
+		})
 		stats.TotalFlows += numFlows
 		wg.Done()
 	}()
