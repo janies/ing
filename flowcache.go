@@ -18,6 +18,10 @@ var v struct {
 // FlowCacheElem embeds a Flow value and a pointer in the PickQueue that holds idle times for
 // each flow.  This gives us an efficient way to delete from the idle queue when a flow is
 // terminated directly from the flow map.
+//
+// TODO: A general solutions would use `interface{}` instead of a `Flow` type, but we want to
+// avoid reflection in our application because it adds overhead. A TODO is to clean this up and
+// make a package to share with others.
 type FlowCacheElem struct {
 	flow Flow
 	iptr *PickNode
