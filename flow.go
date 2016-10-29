@@ -99,7 +99,7 @@ const (
 	ClosureNormal = iota
 	ClosureActiveTimeout
 	ClosureIdleTimeout
-	ClosurePcapEOF
+	ClosureEOS
 	ClosureResourceExhaustion
 )
 
@@ -300,7 +300,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 			if config.Debug.PrintFlows {
 				fmt.Println(flow.String())
 			}
-			flow.ClosureReason = ClosureIdleTimeout
+			flow.ClosureReason = ClosureEOS
 			out <- flow
 		})
 		stats.TotalFlows += numFlows
