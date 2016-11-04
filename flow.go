@@ -40,7 +40,7 @@ type FlowKey struct {
 // Do not use for persistent key-value storage because it may change in future
 // versions.
 func (ft *FlowKey) Hash() (h uint64) {
-	h = fnvHashSlice(ft.Sip.Address[:]) + fnvHashSlice(ft.Dip.Address[:])
+	h = fnvHashSlice([]byte(ft.Sip.Address)) + fnvHashSlice([]byte(ft.Dip.Address))
 	h ^= uint64(ft.Sport)
 	h *= fnvPrime
 	h ^= uint64(ft.Dport)
@@ -58,19 +58,19 @@ func (ft FlowKey) String() string {
 		fallthrough
 	case layers.IPProtocolUDP:
 		if ft.Sip.Version == 4 {
-			return fmt.Sprintf("%s %s:%d -> %s:%d", ft.Proto.String(), ft.Sip.String(), ft.Sport,
-				ft.Dip.String(), ft.Dport)
+			return fmt.Sprintf("%s %s:%d -> %s:%d", ft.Proto.String(), ft.Sip.Address, ft.Sport,
+				ft.Dip.Address, ft.Dport)
 		}
-		return fmt.Sprintf("%s %s.%d -> %s.%d", ft.Proto.String(), ft.Sip.String(), ft.Sport,
-			ft.Dip.String(), ft.Dport)
+		return fmt.Sprintf("%s %s.%d -> %s.%d", ft.Proto.String(), ft.Sip.Address, ft.Sport,
+			ft.Dip.Address, ft.Dport)
 	case layers.IPProtocolICMPv4:
 		return fmt.Sprintf(" %s %d:%d %s -> %s", ft.Proto.String(),
 			layers.ICMPv4TypeCode(ft.Sport).Type(), layers.ICMPv4TypeCode(ft.Sport).Code(),
-			ft.Sip.String(), ft.Dip.String())
+			ft.Sip.Address, ft.Dip.Address)
 	case layers.IPProtocolICMPv6:
 		return fmt.Sprintf(" %s %d:%d %s -> %s", ft.Proto.String(),
 			layers.ICMPv6TypeCode(ft.Sport).Type(), layers.ICMPv6TypeCode(ft.Sport).Code(),
-			ft.Sip.String(), ft.Dip.String())
+			ft.Sip.Address, ft.Dip.Address)
 	default:
 		return fmt.Sprintf("* Unknown flow *")
 	}

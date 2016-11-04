@@ -74,18 +74,18 @@ func printMetaPacket(mp MetaPacket) {
 		fallthrough
 	case layers.IPProtocolUDP:
 		if mp.sip.Version == 4 {
-			fmt.Printf(" %s %s:%d -> %s:%d", mp.protocol.String(), mp.sip.String(), mp.sport,
-				mp.dip.String(), mp.dport)
+			fmt.Printf(" %s %s:%d -> %s:%d", mp.protocol.String(), mp.sip.Address, mp.sport,
+				mp.dip.Address, mp.dport)
 		} else {
-			fmt.Printf(" %s %s.%d -> %s.%d", mp.protocol.String(), mp.sip.String(), mp.sport,
-				mp.dip.String(), mp.dport)
+			fmt.Printf(" %s %s.%d -> %s.%d", mp.protocol.String(), mp.sip.Address, mp.sport,
+				mp.dip.Address, mp.dport)
 		}
 	case layers.IPProtocolICMPv4:
 		fmt.Printf(" %s %s -> %s, typecode: %v", mp.protocol.String(),
-			mp.sip.String(), mp.dip.String(), layers.ICMPv4TypeCode(mp.sport).String())
+			mp.sip.Address, mp.dip.Address, layers.ICMPv4TypeCode(mp.sport).String())
 	case layers.IPProtocolICMPv6:
 		fmt.Printf(" %s %s -> %s, typecode: %v", mp.protocol.String(),
-			mp.sip.String(), mp.dip.String(), layers.ICMPv6TypeCode(mp.sport).String())
+			mp.sip.Address, mp.dip.Address, layers.ICMPv6TypeCode(mp.sport).String())
 	}
 	fmt.Printf(", payload: %v", mp.payloadLength)
 	fmt.Println("")
@@ -192,11 +192,15 @@ func GeneratePackets(done <-chan struct{}, handle *pcap.Handle) <-chan MetaPacke
 						mp.vlanid = dot1q.VLANIdentifier
 					case layers.LayerTypeIPv4:
 						// At this point, we know that 'in' is defragmented.
-						mp.sip.CopyFromNetIP(ip4.SrcIP, true)
-						mp.dip.CopyFromNetIP(ip4.DstIP, true)
+						mp.sip.Address = ip4.SrcIP.String()
+						mp.sip.Version = 4
+						mp.dip.Address = ip4.DstIP.String()
+						mp.dip.Version = 4
 					case layers.LayerTypeIPv6:
-						mp.sip.CopyFromNetIP(ip6.SrcIP, false)
-						mp.dip.CopyFromNetIP(ip6.DstIP, false)
+						mp.sip.Address = ip6.SrcIP.String()
+						mp.sip.Version = 6
+						mp.dip.Address = ip6.DstIP.String()
+						mp.dip.Version = 6
 					case layers.LayerTypeTCP:
 						mp.sport = uint16(tcp.SrcPort)
 						mp.dport = uint16(tcp.DstPort)
