@@ -2,38 +2,10 @@
 
 package main
 
-import (
-	"fmt"
-	"net"
-)
-
-// IPAddress ...
+// IPAddress is a convenience structure that keeps us from passing around byte slices.  This is
+// important for reusing variables like a cache in our goroutines since slice value-copy does not
+// copy the underlying array (just the pointer, len, and cap values).
 type IPAddress struct {
 	Version byte
-	Address [16]byte
-}
-
-// CopyFromNetIP ...
-func (ip *IPAddress) CopyFromNetIP(nip net.IP, isv4 bool) {
-	ip.Address = zeroByteArray
-	copy(ip.Address[:], nip)
-	if isv4 {
-		ip.Version = 4
-		copy(ip.Address[:4], nip)
-	} else {
-		ip.Version = 6
-		copy(ip.Address[:], nip)
-	}
-}
-
-// IsIPV4 ...
-func (ip *IPAddress) IsIPV4() bool {
-	return ip.Version == 4
-}
-
-func (ip IPAddress) String() string {
-	if ip.Version == 4 {
-		return fmt.Sprintf("%s", net.IP(ip.Address[:4]).String())
-	}
-	return fmt.Sprintf("%s", net.IP(ip.Address[:]).String())
+	Address string
 }
