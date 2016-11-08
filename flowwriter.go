@@ -22,6 +22,9 @@ func WriteFlows(done <-chan struct{}, in <-chan Flow) {
 				log.Panicln("Cannot create directory './'. Stopping.")
 			}
 		}
+		if config.OutputPrefix[len(config.OutputPrefix)-1] != '/' {
+			config.OutputPrefix = config.OutputPrefix + "/"
+		}
 		filename := config.OutputPrefix + "flow" + config.OutputSlug + ".json"
 		l := &lumberjack.Logger{Filename: filename, MaxSize: 100, MaxAge: 1}
 		ticker := time.NewTicker(time.Duration(config.OutputRotationInterval) * time.Minute).C
