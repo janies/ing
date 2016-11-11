@@ -92,6 +92,7 @@ type Flow struct {
 	ClosureReason    int
 	SawFINOnly       bool
 	ActiveTimeout    time.Time
+	SawFirstPayload  bool
 }
 
 // Reasons for flow closure
@@ -138,10 +139,14 @@ func (f Flow) String() string {
 // 4. A flow doesn't see a packet after IdleTimeout seconds (PurgeIdleFlows() receiver method).
 //
 // TODO: Implement flow termination logic for reasons 2.
-func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
-	out := make(chan Flow, 256)
+func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) (<-chan Flow, <-chan FirstPayload) {
+	outFlow := make(chan Flow, 256)
+	outPayload := make(chan FirstPayload, 256)
+
 	go func() {
-		defer close(out)
+		defer close(outFlow)
+		defer close(outPayload)
+
 		const (
 			capacity               = 10000000 // Ten million is pretty high
 			oooBound time.Duration = 5 * time.Microsecond
@@ -152,6 +157,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 			flowCache        = NewFlowCache(capacity)
 			currentTimestamp time.Time
 			mp               MetaPacket
+			fp               FirstPayload
 			numFlows         uint64
 			key              FlowKey
 			flow             Flow
@@ -192,7 +198,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						fmt.Println(flow.String())
 					}
 					flow.ClosureReason = ClosureIdleTimeout
-					out <- flow
+					outFlow <- flow
 				})
 
 				// Construct a flow key and its hash.
@@ -229,7 +235,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 							fmt.Println(flow.String())
 						}
 						flow.ClosureReason = ClosureActiveTimeout
-						out <- flow
+						outFlow <- flow
 						// NOTE: Since this is a continuation of a flow, we create a new flow by
 						// dropping out of this branch. DO NOT RETURN.
 					} else {
@@ -246,6 +252,17 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 						if mp.protocol == layers.IPProtocolTCP {
 							flow.RestTCPFlags |= mp.tcpFlags
 							flow.LastTCPSequence = mp.tcpSeq
+							if !flow.SawFirstPayload && mp.payloadLength > 0 {
+								copy(fp.Payload[:], mp.payload[:])
+								fp.IP = mp.sip
+								fp.FlowID = flow.ID
+								fp.Seen = mp.timestamp
+								fp.Sport = mp.sport
+								fp.Dport = mp.dport
+								outPayload <- fp
+								flow.SawFirstPayload = true
+							}
+
 							// Termination reason 1: Normal TCP session ended with FIN or RST
 							if (mp.tcpFlags&FIN == FIN) || (mp.tcpFlags&RST == RST) {
 								if (mp.tcpFlags&FIN == FIN) && (mp.tcpFlags&ACK == 0x00) {
@@ -257,7 +274,7 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 								flowCache.Remove(hash)
 								// This condition filters out small flows if the config is set.
 								if !(config.FilterSmallFlows && flow.NumPackets < 4) {
-									out <- flow
+									outFlow <- flow
 								}
 								continue Loop
 							}
@@ -285,6 +302,16 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 					flow.FirstTCPSequence = mp.tcpSeq
 					flow.LastTCPSequence = mp.tcpSeq
 					flow.SawFINOnly = false
+					if !flow.SawFirstPayload && mp.payloadLength > 0 {
+						copy(fp.Payload[:], mp.payload[:])
+						fp.IP = mp.sip
+						fp.FlowID = flow.ID
+						fp.Seen = mp.timestamp
+						fp.Sport = mp.sport
+						fp.Dport = mp.dport
+						outPayload <- fp
+						flow.SawFirstPayload = true
+					}
 				}
 				flowCache.Insert(flow, hash, mp.timestamp.Add(idleTimeout))
 			}
@@ -301,10 +328,10 @@ func AssignFlows(done <-chan struct{}, in <-chan MetaPacket) <-chan Flow {
 				fmt.Println(flow.String())
 			}
 			flow.ClosureReason = ClosureEOS
-			out <- flow
+			outFlow <- flow
 		})
 		stats.TotalFlows += numFlows
 		wg.Done()
 	}()
-	return out
+	return outFlow, outPayload
 }
