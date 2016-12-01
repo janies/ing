@@ -1,12 +1,18 @@
 # Ing
 
-A packet processor and metadata collector for industrial control system (ISC) and healthcare
-networks.
+A network sensor that captures flow sessions and banners and stores them in JSON files for network
+analysis.
+
+The name _Ing_ is inspired by the Nordic rune [Inguz](http://www.nordicrunes.info/ing.php).
+
 
 ## Dependencies
 
-* [gopacket](https://github.com/google/gopacket) (`go get github.com/google/gopacket`)
+Install the following dependencies with `go get -u [package import path]`.
+
+* [gopacket](https://github.com/google/gopacket)
 * [lumberjack](https://github.com/natefinch/lumberjack) for rolling logs
+* [ahocorasick](github.com/cloudflare/ahocorasick)
 * libpcap and libpcap-devel
 
 
@@ -14,6 +20,25 @@ networks.
 
 The file `$ROOT/build.sh` is the build script for Ing.  It will set the `VERSION` and pass it and
 other identifying data to the `go build` command.
+
+
+## Build a service RPM
+
+The [build-rpm](https://github.com/johnzachary/ing/tree/build-rpm) branch will build an RPM that installs
+`ing` as a service.  Please see the branch for installed binary, config, and service file details.
+
+
+## Output files
+
+Files are written to the `output` directory by default, but this is configurable (see below).  Two types
+of JSON files are written: _flow_ and _banners_.  Flow files are sessionized based on the standard
+`{source IP, destination ip, source port, destination port, protocol}` five-tuple and a VLAN tag (which may
+not be present).  Flows terminate if the session ends "normally" with a `FIN` or `RST` flag for TCP sessions,
+if the session hasn't seen a packet during an idle timeout period, or if the session traffic exceeds an
+active timeout period.  Banners are extracted from the first packet with a non-empty payload based on the
+terms in the [etc/banner-terms.json](https://github.com/johnzachary/ing/blob/master/etc/banner-terms.json)
+file.
+
 
 ## Usage
 ```
@@ -25,10 +50,14 @@ INPUT: Packet source either as a PCAP file or a network device.
 OPTIONS:
   -active-timeout uint
     	Active flow timeout in seconds (default 1800)
+  -banner-terms string
+    	Path to JSON file of banner terms (default "./banner-terms.json")
   -bpf string
     	Berkeley Packet Filter expression
-  -debug-drop-flows
-    	Don't write flows to files
+  -debug-drop-output
+    	Drop all output
+  -debug-print-banners
+    	Print Banners in short form
   -debug-print-errors
     	Print errors
   -debug-print-flows
