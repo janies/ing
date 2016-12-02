@@ -1,4 +1,3 @@
-// Copyright (c) 2016 Threat Trace, LLC. All rights reserved.
 // This source code is covered by the license found in the LICENSE file.
 //
 // Ing is a packet processor and metadata collector based on gopacket.  It reads packets from a

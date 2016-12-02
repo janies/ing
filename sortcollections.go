@@ -1,4 +1,5 @@
-// Copyright (c) 2016 Threat Trace, LLC. All rights reserved.
+// This source code is covered by the license found in the LICENSE file.
+//
 // Implementations of sort.Interface for collections that can be sorted by the package Sort.
 // See https://golang.org/pkg/sort/#Interface
 

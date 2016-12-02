@@ -1,3 +1,5 @@
+# This source code is covered by the license found in the LICENSE file.
+
 VERSION := 0.1.0
 BUILD_TIME := $(shell date -u +%Y-%m-%d_%I:%M:%S%p)
 GIT_HASH := $(shell git rev-parse HEAD)
