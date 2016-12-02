@@ -1,3 +1,5 @@
+// This source code is covered by the license found in the LICENSE file.
+
 package main
 
 import (
