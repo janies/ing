@@ -1,5 +1,7 @@
 # Ing
 
+[![License](http://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](http://opensource.org/licenses/MIT)
+
 A network sensor that captures flow sessions and banners and stores them in
 JSON files for network analysis.
 
