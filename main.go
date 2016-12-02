@@ -17,11 +17,15 @@ import (
 	"github.com/google/gopacket/pcap"
 )
 
+// Build variables
+var (
+	Version   string // Version number of application
+	BuildTime string // Application build time
+	GitHash   string // Current git branch from which the applicatoin was built
+)
+
 // Config groups global configuration values.
 var config struct {
-	Version                string // Version number of application
-	BuildTime              string // Application build time
-	GitHash                string // Current git branch from which the applicatoin was built
 	ActiveTimeout          uint   // Duration in seconds for active flow terminations
 	IdleTimeout            uint   // Duration in seconds for terminating inactive flows
 	IdlePacketDuration     int    // Number of packets to skip before checking for idle timeouts
@@ -82,9 +86,9 @@ func main() {
 	args := flag.Args()
 
 	if *showVersion {
-		fmt.Println(os.Args[0], "version", config.Version)
-		fmt.Println("Build timestamp: ", config.BuildTime)
-		fmt.Println("Git commit: ", config.GitHash)
+		fmt.Println(os.Args[0], "version", Version)
+		fmt.Println("Build timestamp:", BuildTime)
+		fmt.Println("Git commit:", GitHash)
 		os.Exit(0)
 	}
 
