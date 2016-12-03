@@ -35,7 +35,7 @@ func WriteFlows(done <-chan struct{}, in <-chan Flow) {
 			case <-done:
 				break Loop
 			case <-ticker:
-				l.Rotate() // Rotate the log file every five minutes.
+				l.Rotate() // Rotate the log file based on `config.OutputRotationInterval`.
 			default:
 				b, err := json.Marshal(f)
 				if err != nil {
